@@ -73,7 +73,16 @@ class Agent:
 
         # ③ 标注段落角色 → RoleMap
         if rolemap is not None:
-            self._emit("标注角色", "RoleMap 由用户直接给定（JSON），跳过标注", status="ok")
+            # 外部给定（宿主 Agent 自标）的 RoleMap 也要过校验：角色合法、非表格段全覆盖
+            from core.schema import BASE_ROLES
+            expected = {p["idx"] for p in paragraphs if not p.get("in_table")}
+            bad_roles = {r for r in rolemap.values() if r not in BASE_ROLES}
+            if bad_roles:
+                raise ValueError(f"RoleMap 含非法角色 {sorted(bad_roles)}，合法枚举：{BASE_ROLES}")
+            missing = expected - set(rolemap)
+            if missing:
+                raise ValueError(f"RoleMap 未覆盖这些非表格段落：{sorted(missing)}")
+            self._emit("标注角色", "RoleMap 由外部给定（JSON），校验通过，跳过标注", status="ok")
         else:
             self._emit("标注角色", "正在逐段判断角色（标题/正文/落款/日期 ...）")
             from core.label_roles import label_roles

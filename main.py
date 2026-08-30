@@ -26,7 +26,20 @@ def main():
     ap.add_argument("--report", help="对照报告路径（默认 <out去掉扩展名>_report.md）")
     ap.add_argument("--verify", action="store_true",
                     help="排版后用同一个多模态模型做一轮视觉验证并定向修复")
+    ap.add_argument("--extract-only", action="store_true",
+                    help="（Agent 内置智能模式）只抽取段落清单 JSON，不做排版；"
+                         "宿主 Agent 读清单后自行产出 RoleMap/FormatSpec 再回调本程序")
     args = ap.parse_args()
+
+    if args.extract_only:
+        from core.extract import extract_paragraphs
+        paragraphs = extract_paragraphs(args.target)
+        out_json = os.path.splitext(args.out)[0] + "_paragraphs.json"
+        os.makedirs(os.path.dirname(os.path.abspath(out_json)), exist_ok=True)
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(paragraphs, f, ensure_ascii=False, indent=2)
+        print(f"段落清单已写出: {out_json}（{len(paragraphs)} 段）")
+        return
 
     if not args.spec and not args.spec_json and not args.template:
         ap.error("必须提供 --spec（规范文字）、--template（模板 docx）或 --spec-json（FormatSpec JSON）之一")

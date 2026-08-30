@@ -23,9 +23,9 @@ description: 通用文档格式排版。当用户给一份"格式规范"（自�
 ## 环境要求
 
 - Python 3.10+，依赖：`pip install -r requirements.txt`（python-docx、requests、PyMuPDF；Windows 渲染另需 pywin32）
-- 模型配置（二选一）：
-  - 环境变量 / `.env` 文件：`LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`（可选 `LLM_VISION_MODEL`、`LLM_TIMEOUT`、`LLM_TEMPERATURE`）
-  - 或完全不用模型：直接提供 `spec_std.json` 与 `rolemap_std.json` 走确定性降级链路
+- **在 Agent 环境里无需配置任何模型**：理解工作由宿主 Agent 完成（见"用法一"）
+- 独立 API 模式（无 Agent 的环境）才需要模型配置：
+  环境变量 / `.env` 文件：`LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`（可选 `LLM_VISION_MODEL`、`LLM_TIMEOUT`、`LLM_TEMPERATURE`）
 
 ## 模型选择（重要：建议多模态）
 
@@ -42,33 +42,92 @@ description: 通用文档格式排版。当用户给一份"格式规范"（自�
 
 ## 使用方法
 
-在本 skill 目录下运行：
+本 skill 有两种用法。**在 Agent 环境里优先用"内置智能模式"——零配置，
+不需要任何 API key，理解工作由你（宿主 Agent）自己完成。**
 
-### 规范文字 → 排版
+### 用法一：Agent 内置智能模式（默认推荐，零配置）
+
+你是宿主 Agent 时的执行流程：
+
+1. **抽取目标文档结构**：
+
+   ```bash
+   python main.py --extract-only --target 待排版.docx --out 输出目录/排版后.docx
+   ```
+
+   得到 `输出目录/排版后_paragraphs.json`，每段含
+   `idx/text/size_pt/bold/alignment/style_name/in_table` 及编号元数据。
+
+2. **你自己产出 FormatSpec**（格式规则 JSON）：
+   - 用户给的是**规范文字**：读懂它，按下面的 schema 写出 JSON，保存为
+     `输出目录/排版后_formatspec.json`；
+   - 用户给的是**模板 docx**：先对模板跑一次 `--extract-only`，读懂各段角色
+     （标题/正文/落款……），写入 `模板_rolemap.json`（格式
+     `{"0": "title", "1": "body", ...}`），稍后用 `--template 模板.docx
+     --template-rolemap-json 模板_rolemap.json` 让代码确定性读取模板格式。
+
+   FormatSpec schema：
+
+   ```json
+   {
+     "page": {"margin": {"top_mm": 37, "bottom_mm": 35, "left_mm": 28, "right_mm": 26},
+              "line_grid": {"line_pt": 28}},
+     "roles": {
+       "body": {"font_eastasia": "仿宋_GB2312", "font_ascii": "Times New Roman",
+                "size_pt": 16, "bold": false, "alignment": "justify",
+                "first_line_indent_chars": 2, "line_spacing": {"type": "exact", "pt": 28}}
+     }
+   }
+   ```
+
+   角色枚举：`title/subtitle/heading_1/heading_2/heading_3/body/signature/date/
+   attachment_label/attachment/other`。`body` 必填；对齐取值 `left/center/right/justify`；
+   `size_pt` 8~72，页边距 5~50mm。规范里没提的角色不要写，没提的字段不要编。
+
+3. **你自己产出 RoleMap**（段落角色 JSON）：读第 1 步的段落清单，
+   为每个 `in_table=false` 的段落从枚举里选角色，保存为
+   `输出目录/排版后_rolemap.json`，格式 `{"0": "title", "1": "body", ...}`，
+   必须覆盖所有非表格段落。判断依据：文字内容、位置顺序、当前格式提示；
+   落款在末尾署名感强；日期含"年/月/日"；标题在最前且独立成行。
+
+4. **执行排版**（确定性代码接管）：
+
+   ```bash
+   # 规范文字来源（FormatSpec 由你在第 2 步产出）
+   python main.py --spec-json 输出目录/排版后_formatspec.json \
+       --rolemap-json 输出目录/排版后_rolemap.json \
+       --target 待排版.docx --out 输出目录/排版后.docx
+
+   # 模板来源
+   python main.py --template 模板.docx --template-rolemap-json 模板_rolemap.json \
+       --rolemap-json 输出目录/排版后_rolemap.json \
+       --target 待排版.docx --out 输出目录/排版后.docx
+   ```
+
+   你产出的 JSON 会被代码再次校验（角色合法、段落全覆盖、数值边界），
+   校验失败会报错并说明原因，修正后重跑即可。
+
+### 用法二：独立 API 模式（可选）
+
+在没有 Agent 的环境（服务器、定时任务、本地裸跑）才需要配置模型：
+复制 `.env.example` 为 `.env`，填 `LLM_BASE_URL / LLM_API_KEY / LLM_MODEL`
+（建议多模态模型，见上节），然后：
 
 ```bash
+# 规范文字作为格式来源（LLM 自动抽取规则）
 python main.py --spec 规范文字.txt --target 待排版.docx --out 输出目录/排版后.docx
-```
 
-### Word 模板 → 排版
-
-```bash
+# Word 模板作为格式来源
 python main.py --template 模板.docx --target 待排版.docx --out 输出目录/排版后.docx
 ```
 
 模板可以是任何已按规范排好版的文档（党委会议题材料、合同范本、法律意见书、
 咨询报告、论文范文……），无需为模板做任何改造或标注。
 
-### 无模型降级（全部跳过 LLM）
-
-```bash
-python main.py --spec-json examples/spec_std.json --rolemap-json examples/rolemap_std.json \
-    --target examples/messy.docx --out 输出目录/排版后.docx
-```
-
-### 视觉自检（可选，需要多模态模型）
+### 视觉自检（可选，仅用法二 + 多模态模型）
 
 加 `--verify`：排版后渲染成图，由视觉模型对照规范质检，发现偏差定向修复并重排一次（只一轮，不做开放循环）。
+用法一中若你（宿主 Agent）具备图像理解能力，也可以自己渲染后检查：输出目录 `*_verify_render/` 下是逐页 PNG。
 
 ## 输出产物
 
