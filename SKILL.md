@@ -17,7 +17,7 @@ description: 通用文档格式排版。当用户给一份"格式规范"（自�
 
 ## 环境要求
 
-- Python 3.10+，依赖：`pip install -r requirements.txt`（python-docx、requests、PyMuPDF、streamlit；Windows 渲染另需 pywin32）
+- Python 3.10+，依赖：`pip install -r requirements.txt`（python-docx、requests、PyMuPDF；Windows 渲染另需 pywin32）
 - 模型配置（二选一）：
   - 环境变量 / `.env` 文件：`LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL`（可选 `LLM_VISION_MODEL`、`LLM_TIMEOUT`、`LLM_TEMPERATURE`）
   - 或完全不用模型：直接提供 `spec_std.json` 与 `rolemap_std.json` 走确定性降级链路
