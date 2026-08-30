@@ -1,0 +1,6 @@
+Board Resolution Formatting Rules:
+1. Page: A4, margins 25.4 mm on all sides.
+2. Title: Times New Roman, 16 pt, bold, centered.
+3. Body: Times New Roman, 12 pt, justified, first-line indent 2 characters, line spacing 1.5.
+4. Signature block: Times New Roman, 12 pt, right-aligned.
+5. Date line: Times New Roman 12 pt, right-aligned.

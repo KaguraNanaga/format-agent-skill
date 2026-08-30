@@ -1,5 +1,7 @@
 # format-agent-skill
 
+**中文 | [English](README_EN.md)**
+
 通用文档格式排版 Agent Skill。**理解归 AI，动手归代码，中间用 JSON 交接。**
 
 给它一份格式规范（自然语言规范文字，或排好版的 Word 模板）加一份格式混乱的 docx，
