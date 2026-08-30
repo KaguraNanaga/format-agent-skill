@@ -113,6 +113,30 @@ class Agent:
                    f"并应用到 {n_changed} 个段落，输出 {os.path.basename(out_path)}",
                    status="ok", data=changelog)
 
+        # ④.5 文本一致性校验：排版只许改格式，正文一个字都不能动
+        from core.text_integrity import check_text_integrity
+        allowed_additions = []
+        if (spec.get("toc") or {}).get("enabled"):
+            allowed_additions = ["目录", "（在 Word 中右键此处选择「更新域」生成目录）"]
+        # 手工编号被自动编号替换而剥掉的前缀属于预期内的文字变化
+        expected_prefixes = []
+        changed_idxs = {c["idx"] for c in changelog
+                        if "manual_number_prefix_removed" in c.get("changed_fields", [])}
+        for p in paragraphs:
+            if p["idx"] in changed_idxs and p.get("manual_number"):
+                expected_prefixes.append(str(p["manual_number"]))
+        integrity = check_text_integrity(
+            target_path, out_path,
+            allowed_additions=allowed_additions,
+            expected_stripped_prefixes=expected_prefixes)
+        if integrity["ok"]:
+            self._emit("执行排版", "文本一致性校验通过：正文内容零改动", status="ok")
+        else:
+            self._emit("执行排版",
+                       f"文本一致性校验发现差异：新增 {len(integrity['added'])} 段、"
+                       f"缺失 {len(integrity['removed'])} 段，请人工核对",
+                       status="err", data=integrity)
+
         # ⑤ 视觉自检（可选，一轮定向修复，不做开放循环）
         # 注意：自检是加分项，失败（如模型不支持图片）不能拖垮已完成的排版结果。
         issues, applied = [], []
@@ -142,7 +166,14 @@ class Agent:
                         from core.report_docx import build_report_docx
                         build_report_docx(changelog, spec, report_docx_path)
                         apply_format(target_path, spec, rolemap, tracked_path, track=True)
-                        self._emit("视觉自检", "修复后重排完成", status="ok")
+                        integrity = check_text_integrity(
+                            target_path, out_path,
+                            allowed_additions=allowed_additions,
+                            expected_stripped_prefixes=expected_prefixes)
+                        self._emit("视觉自检", "修复后重排完成"
+                                   + ("，文本一致性校验通过" if integrity["ok"]
+                                      else "，但文本一致性校验发现差异，请人工核对"),
+                                   status="ok" if integrity["ok"] else "err")
                     else:
                         self._emit("视觉自检",
                                    "这些问题无法安全自动修复，已保留在问题清单中供人工处理",
@@ -179,6 +210,7 @@ class Agent:
             "spec": spec, "paragraphs": paragraphs, "rolemap": rolemap,
             "stylemap": stylemap, "changelog": changelog,
             "issues": issues, "applied_fixes": applied,
+            "text_integrity": integrity,
             "out_path": out_path, "report_path": report_path,
             "report_docx_path": report_docx_path, "tracked_path": tracked_path,
         }
