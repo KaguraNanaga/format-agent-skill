@@ -1,0 +1,89 @@
+{
+  "page": {
+    "size": "A4",
+    "margin": {
+      "top_mm": 37,
+      "bottom_mm": 35,
+      "left_mm": 28,
+      "right_mm": 26
+    },
+    "line_grid": {
+      "line_pt": 28
+    }
+  },
+  "roles": {
+    "title": {
+      "font_eastasia": "方正小标宋简体",
+      "font_ascii": "Times New Roman",
+      "size_pt": 22,
+      "bold": false,
+      "alignment": "center",
+      "line_spacing": {
+        "type": "exact",
+        "pt": 28
+      }
+    },
+    "heading_1": {
+      "font_eastasia": "黑体",
+      "size_pt": 16,
+      "alignment": "left",
+      "first_line_indent_chars": 2,
+      "line_spacing": {
+        "type": "exact",
+        "pt": 28
+      }
+    },
+    "heading_2": {
+      "font_eastasia": "楷体_GB2312",
+      "font_ascii": "Times New Roman",
+      "size_pt": 16,
+      "alignment": "left",
+      "first_line_indent_chars": 2,
+      "line_spacing": {
+        "type": "exact",
+        "pt": 28
+      }
+    },
+    "heading_3": {
+      "font_eastasia": "仿宋_GB2312",
+      "font_ascii": "Times New Roman",
+      "size_pt": 16,
+      "bold": true,
+      "alignment": "left",
+      "first_line_indent_chars": 2,
+      "line_spacing": {
+        "type": "exact",
+        "pt": 28
+      }
+    },
+    "body": {
+      "font_eastasia": "仿宋_GB2312",
+      "font_ascii": "Times New Roman",
+      "size_pt": 16,
+      "alignment": "justify",
+      "first_line_indent_chars": 2,
+      "line_spacing": {
+        "type": "exact",
+        "pt": 28
+      }
+    },
+    "signature": {
+      "font_eastasia": "仿宋_GB2312",
+      "size_pt": 16,
+      "alignment": "right",
+      "line_spacing": {
+        "type": "exact",
+        "pt": 28
+      }
+    },
+    "date": {
+      "font_eastasia": "仿宋_GB2312",
+      "size_pt": 16,
+      "alignment": "right",
+      "line_spacing": {
+        "type": "exact",
+        "pt": 28
+      }
+    }
+  }
+}
