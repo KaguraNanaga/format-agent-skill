@@ -21,6 +21,9 @@ _HEADING_PATTERNS = [
     (re.compile(r"^表\s*\d+([-.]\d+)?"), "table_caption"),
     (re.compile(r"^[一二三四五六七八九十百]+、"), "heading_1"),
     (re.compile(r"^[（(][一二三四五六七八九十]+[）)]"), "heading_2"),
+    # 法律文书/合同条款惯例：第一章/第X编 → heading_1；第X节/第X条 → heading_2
+    (re.compile(r"^第[一二三四五六七八九十百零〇\d]+[章编部][\s：:、]"), "heading_1"),
+    (re.compile(r"^第[一二三四五六七八九十百零〇\d]+[节条][\s：:、]"), "heading_2"),
 ]
 _HEADING_MAX_LEN = 40
 
