@@ -2,7 +2,7 @@
 
 **中文 | [English](README_EN.md)**
 
-「最终版」通用文档格式排版 Agent Skill（黑客松演示名称）。**理解归 AI，动手归代码，中间用 JSON 交接。**
+「最终版」通用文档格式排版 Agent Skill。**理解归 AI，动手归代码，中间用 JSON 交接。**
 
 给它一份格式规范（自然语言规范文字，或排好版的 Word 模板）加一份格式混乱的 docx，
 Agent 自主完成理解规范、识别文档结构、逐段改写格式，输出可直接交付的 Word 文档。
@@ -113,5 +113,5 @@ python main.py --spec examples/spec.txt --target examples/messy.docx --out out/�
 
 ## 相关
 
-- 黑客松完整版（GUI 演示界面、四象限案例、路演页）：
+- VibeHacks 黑客松完整版（GUI 演示界面、四象限案例、路演页）：
   [format-agent-01](https://github.com/KaguraNanaga/format-agent-01)（已归档）
