@@ -8,6 +8,7 @@ from docx.shared import Mm
 
 from core.executor import (
     set_doc_grid,
+    set_run_fonts,
 )
 from core.style_set import (
     apply_named_style,
@@ -17,12 +18,120 @@ from core.style_set import (
 )
 from core.track_changes import mark_paragraph_revision, snapshot_paragraph
 
+_HF_ALIGN = {"left": 0, "center": 1, "right": 2, "justify": 3}
+
+
+def _apply_header_footer(doc, page):
+    """页眉页脚：text 写入（可选）+ 字体/字号/对齐；footer.page_number 插 PAGE 域。"""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    section = doc.sections[0]
+    changed = []
+    for which, container in (("header", section.header), ("footer", section.footer)):
+        rule = page.get(which)
+        if not isinstance(rule, dict) or not rule:
+            continue
+        if rule.get("text") is not None:
+            # 覆盖第一段文字，字体随后统一刷
+            p = container.paragraphs[0] if container.paragraphs else container.add_paragraph()
+            for r in p.runs:
+                r.text = ""
+            if p.runs:
+                p.runs[0].text = rule["text"]
+            else:
+                p.add_run(rule["text"])
+            changed.append(f"{which}_text")
+        if rule.get("page_number"):
+            # 页码域：PAGE
+            p = container.paragraphs[0] if container.paragraphs else container.add_paragraph()
+            if p.runs or p.text:
+                p = container.add_paragraph()
+            run = p.add_run()
+            fld_begin = OxmlElement("w:fldChar")
+            fld_begin.set(qn("w:fldCharType"), "begin")
+            instr = OxmlElement("w:instrText")
+            instr.set(qn("xml:space"), "preserve")
+            instr.text = "PAGE"
+            fld_end = OxmlElement("w:fldChar")
+            fld_end.set(qn("w:fldCharType"), "end")
+            run._element.append(fld_begin)
+            run._element.append(instr)
+            run._element.append(fld_end)
+            changed.append(f"{which}_page_number")
+        font_kwargs = {}
+        if rule.get("font_eastasia"):
+            font_kwargs["eastasia"] = rule["font_eastasia"]
+        if rule.get("font_ascii"):
+            font_kwargs["ascii_font"] = rule["font_ascii"]
+        if rule.get("size_pt") is not None:
+            font_kwargs["size_pt"] = rule["size_pt"]
+        if rule.get("bold") is not None:
+            font_kwargs["bold"] = rule["bold"]
+        for p in container.paragraphs:
+            if font_kwargs:
+                for run in p.runs:
+                    set_run_fonts(run, **font_kwargs)
+            if rule.get("alignment") in _HF_ALIGN:
+                p.alignment = _HF_ALIGN[rule["alignment"]]
+        if font_kwargs:
+            changed.append(f"{which}_font")
+    return changed
+
+
+def _apply_table_rule(doc, table_rule):
+    """表格排版（v1）：首行表头加粗/居中 + 单元格字体字号 + 边框。
+    只刷段落与字符格式，不动表格结构（合并单元格等保持原样）。"""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    if not isinstance(table_rule, dict) or not table_rule:
+        return []
+    changed = False
+    for table in doc.tables:
+        changed = True
+        if table_rule.get("borders"):
+            tbl_pr = table._tbl.tblPr
+            borders = tbl_pr.find(qn("w:tblBorders"))
+            if borders is None:
+                borders = OxmlElement("w:tblBorders")
+                tbl_pr.append(borders)
+            for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+                el = borders.find(qn(f"w:{edge}"))
+                if el is None:
+                    el = OxmlElement(f"w:{edge}")
+                    borders.append(el)
+                el.set(qn("w:val"), "single")
+                el.set(qn("w:sz"), "4")
+        for r_i, row in enumerate(table.rows):
+            is_header = r_i == 0
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    font_kwargs = {}
+                    if table_rule.get("font_eastasia"):
+                        font_kwargs["eastasia"] = table_rule["font_eastasia"]
+                    if table_rule.get("font_ascii"):
+                        font_kwargs["ascii_font"] = table_rule["font_ascii"]
+                    if table_rule.get("size_pt") is not None:
+                        font_kwargs["size_pt"] = table_rule["size_pt"]
+                    if is_header and table_rule.get("header_bold"):
+                        font_kwargs["bold"] = True
+                    if font_kwargs:
+                        for run in p.runs:
+                            set_run_fonts(run, **font_kwargs)
+                    align_key = "header_alignment" if is_header else "body_alignment"
+                    if table_rule.get(align_key) in _HF_ALIGN:
+                        p.alignment = _HF_ALIGN[table_rule[align_key]]
+    return ["table_format"] if changed else []
+
 
 def apply_format(docx_path, spec, rolemap, out_path, track=False):
     """应用 FormatSpec × RoleMap，输出 docx，返回 changelog list[dict]。
     rolemap: {idx: role}（idx 对应 extract.py 的段落序号）。
     模板未明确指定的角色统一与正文保持一致（套用 body 规则与样式）。
-    表格内段落（idx >= len(doc.paragraphs)）v1 跳过。
+
+    页面级：页边距/行网格 + 页眉页脚（page.header/footer，footer 支持页码域）；
+    表格：spec.table 规则（首行表头加粗居中、单元格字体字号、边框）。
     track=True 时输出修订模式文档：段落/字符格式改动以 w:pPrChange /
     w:rPrChange 记录，Word 审阅视图可见。
     """
@@ -48,6 +157,10 @@ def apply_format(docx_path, spec, rolemap, out_path, track=False):
     line_grid = page.get("line_grid") or {}
     if line_grid.get("line_pt") is not None:
         set_doc_grid(doc, line_pt=line_grid["line_pt"])
+    # ---- 页眉页脚 + 表格 ----
+    extra_changes = []
+    extra_changes.extend(_apply_header_footer(doc, page))
+    extra_changes.extend(_apply_table_rule(doc, spec.get("table")))
 
     # ---- 段落级 ----
     changelog = []
@@ -80,6 +193,16 @@ def apply_format(docx_path, spec, rolemap, out_path, track=False):
             "text": p.text.strip()[:30],
             "changed_fields": changed,
             "fallback_to_target_body": fallback_to_target_body,
+        })
+
+    if extra_changes:
+        changelog.append({
+            "idx": -1,
+            "role": "page",
+            "style_name": "-",
+            "text": "页眉页脚/表格（页面级）",
+            "changed_fields": extra_changes,
+            "fallback_to_target_body": False,
         })
 
     doc.save(out_path)

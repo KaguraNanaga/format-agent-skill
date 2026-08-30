@@ -61,6 +61,34 @@ def validate_spec(spec):
                     v = line_grid.get("line_pt")
                     if v is not None and (not _is_num(v) or not (8 <= v <= 72)):
                         errors.append(f"page.line_grid.line_pt={v!r} 非法：必须是 8~72 磅的数值")
+            # 页眉/页脚（可选）：text + 字体字号对齐；footer 支持 page_number
+            for hf in ("header", "footer"):
+                sec = page.get(hf)
+                if sec is None:
+                    continue
+                if not isinstance(sec, dict):
+                    errors.append(f"page.{hf} 必须是 object")
+                    continue
+                v = sec.get("size_pt")
+                if v is not None and (not _is_num(v) or not (SIZE_PT_RANGE[0] <= v <= SIZE_PT_RANGE[1])):
+                    errors.append(f"page.{hf}.size_pt={v!r} 非法：必须是 {SIZE_PT_RANGE[0]}~{SIZE_PT_RANGE[1]} 磅")
+                v = sec.get("alignment")
+                if v is not None and v not in ALIGNMENTS:
+                    errors.append(f"page.{hf}.alignment={v!r} 非法：必须是 {sorted(ALIGNMENTS)} 之一")
+
+    # ---- table（可选）：表格排版规则 ----
+    table = spec.get("table")
+    if table is not None:
+        if not isinstance(table, dict):
+            errors.append("table 必须是 object")
+        else:
+            v = table.get("size_pt")
+            if v is not None and (not _is_num(v) or not (SIZE_PT_RANGE[0] <= v <= SIZE_PT_RANGE[1])):
+                errors.append(f"table.size_pt={v!r} 非法：必须是 {SIZE_PT_RANGE[0]}~{SIZE_PT_RANGE[1]} 磅")
+            for k in ("header_alignment", "body_alignment"):
+                v = table.get(k)
+                if v is not None and v not in ALIGNMENTS:
+                    errors.append(f"table.{k}={v!r} 非法：必须是 {sorted(ALIGNMENTS)} 之一")
 
     # ---- roles ----
     roles = spec.get("roles")

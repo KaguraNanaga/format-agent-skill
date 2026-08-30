@@ -293,6 +293,96 @@ def _page_section(doc):
     return page
 
 
+def _header_footer_rules(doc):
+    """读模板的页眉页脚：第一个非空段的文字 + 生效格式；页脚有 PAGE 域则记 page_number。"""
+    rules = {}
+    s = doc.sections[0]
+    for which, hf in (("header", s.header), ("footer", s.footer)):
+        try:
+            text_ps = [p for p in hf.paragraphs if p.text.strip()]
+        except Exception:  # 无页眉页脚部件
+            continue
+        has_page_field = any(
+            "PAGE" in (el.text or "")
+            for el in hf._element.iter(qn("w:instrText")))
+        if not text_ps and not has_page_field:
+            continue
+        rule = {}
+        if text_ps:
+            p = text_ps[0]
+            rule["text"] = p.text.strip()
+            props = effective_props(p)
+            if props.get("eastasia"):
+                rule["font_eastasia"] = props["eastasia"]
+            if props.get("ascii"):
+                rule["font_ascii"] = props["ascii"]
+            if props.get("size_pt"):
+                rule["size_pt"] = props["size_pt"]
+            if props.get("bold") is not None:
+                rule["bold"] = bool(props["bold"])
+            a = _para_alignment(p)
+            if a:
+                rule["alignment"] = a
+        if which == "footer" and has_page_field:
+            rule["page_number"] = True
+        rules[which] = rule
+    return rules
+
+
+def _table_rule(doc):
+    """读模板第一张表：表头行格式（加粗/居中）+ 单元格字体字号 + 是否有边框。"""
+    if not doc.tables:
+        return None
+    t = doc.tables[0]
+    rule = {}
+    rows = t.rows
+    if not rows:
+        return None
+    header_props = None
+    for p in rows[0].cells[0].paragraphs:
+        header_props = effective_props(p)
+        a = _para_alignment(p)
+        if a:
+            rule["header_alignment"] = a
+        break
+    if header_props and header_props.get("bold") is not None:
+        rule["header_bold"] = bool(header_props["bold"])
+    # 正文行字体字号
+    body_row = rows[1] if len(rows) > 1 else rows[0]
+    for p in body_row.cells[0].paragraphs:
+        props = effective_props(p)
+        if props.get("eastasia"):
+            rule["font_eastasia"] = props["eastasia"]
+        if props.get("ascii"):
+            rule["font_ascii"] = props["ascii"]
+        if props.get("size_pt"):
+            rule["size_pt"] = props["size_pt"]
+        a = _para_alignment(p)
+        if a:
+            rule["body_alignment"] = a
+        break
+    if header_props:
+        rule.setdefault("font_eastasia", header_props.get("eastasia") or "宋体")
+        rule.setdefault("size_pt", header_props.get("size_pt") or 10.5)
+
+    # 边框：直接 tblBorders 或表格样式（Table Grid 等）继承都算有边框
+    borders = t._tbl.tblPr.find(qn("w:tblBorders"))
+    if borders is not None:
+        any_border = any(
+            (el.get(qn("w:val")) or "single") not in ("none", "nil")
+            for el in borders)
+        rule["borders"] = any_border
+    else:
+        style_name = ""
+        try:
+            style_name = (t.style.name or "").lower() if t.style else ""
+        except Exception:
+            style_name = ""
+        if "grid" in style_name or "网格" in style_name:
+            rule["borders"] = True
+    return rule or None
+
+
 def extract_rules_from_template(template_path, rolemap):
     """模板 docx + RoleMap → FormatSpec（经 schema 校验）。
     rolemap: {idx: role}。每个角色取第一个代表段落读格式。
@@ -337,6 +427,11 @@ def extract_rules_from_template(template_path, rolemap):
         rule.setdefault("alignment", "justify" if role == "body" else "left")
 
     spec = {"page": _page_section(doc), "roles": roles}
+    # 页眉页脚 + 表格规则（模板有就读，没有就不编）
+    spec["page"].update(_header_footer_rules(doc))
+    table_rule = _table_rule(doc)
+    if table_rule:
+        spec["table"] = table_rule
     # 行网格一致性：模板里的 docGrid 常是 Word 默认值（如 15.6pt），与正文实际
     # 固定行距不一致时，网格会干扰排版。正文有明确固定行距时，以正文行距为准。
     body_ls = (roles.get("body") or {}).get("line_spacing") or {}
