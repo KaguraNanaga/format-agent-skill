@@ -11,7 +11,9 @@ Agent 自主完成理解规范、识别文档结构、逐段改写格式，输�
 
 ## 安装（对你的 Agent 说一句话）
 
-> 帮我安装这个 skill：https://github.com/KaguraNanaga/format-agent-skill
+```
+帮我安装这个 skill：https://github.com/KaguraNanaga/format-agent-skill
+```
 
 Agent 会读取 `SKILL.md`，自行完成安全审计、依赖安装与冒烟测试。
 
@@ -45,22 +47,6 @@ python main.py --template "examples/模板-党委会议题样表.docx" --target 
 # 排版后再做一轮视觉自检（需多模态模型）
 python main.py --spec examples/spec.txt --target examples/messy.docx --out out/排版后.docx --verify
 ```
-
-## 模型配置
-
-复制 `.env.example` 为 `.env` 并填写：
-
-```bash
-LLM_BASE_URL=https://你的端点/v1
-LLM_API_KEY=你的key
-LLM_MODEL=你的模型
-```
-
-**建议多模态模型**（支持图像输入：GPT-4o、Kimi K3、Qwen-VL、GLM-4V 等）。
-排版主流程只需文本能力；视觉自检环节要把渲染图交给模型质检，纯文本模型无法使用。
-
-不配模型也能跑：直接提供 FormatSpec / RoleMap JSON，走确定性降级链路
-（`python main.py --spec-json ... --rolemap-json ...`）。
 
 ## 输出产物
 
@@ -110,8 +96,20 @@ LLM_MODEL=你的模型
 **适用**：以段落为主的文书——党委会/股东会/董事会材料、合同、法律意见书、
 咨询报告、论文、新闻稿、通知、方案。
 
-**不适用**（当前版本）：以表格为主体的文档（花名册、报价单）、封面页设计、
-页眉页脚、目录、多栏排版。这些段落保持原样，不会被改坏。
+**不适用**（当前版本）：以表格为主体的文档（花名册、报价单——表格内容会保留
+原样不动）、封面页设计。这些部分保持原样，不会被改坏。
+
+## 高级：独立 API 模式（可选）
+
+在 Agent 环境里使用**无需任何模型配置**——理解工作由宿主 Agent 完成。
+只有在没有 Agent 的环境（服务器、定时任务、本地裸跑）才需要自配模型：
+复制 `.env.example` 为 `.env`，填入 OpenAI 兼容端点的
+`LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL`。
+建议多模态模型（支持图像输入，如 GPT-4o、Kimi K3、Qwen-VL、GLM-4V）——
+排版主流程只需文本能力，但视觉自检要把渲染图交给模型质检。
+
+完全不配模型也能跑：直接提供 FormatSpec / RoleMap JSON 走确定性降级链路
+（`python main.py --spec-json ... --rolemap-json ...`）。
 
 ## 相关
 

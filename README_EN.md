@@ -13,7 +13,9 @@ and delivers a production-ready Word document.
 
 ## Install (one sentence to your Agent)
 
-> Install this skill for me: https://github.com/KaguraNanaga/format-agent-skill
+```
+Install this skill for me: https://github.com/KaguraNanaga/format-agent-skill
+```
 
 Your Agent reads `SKILL.md`, then performs its own security audit, dependency
 setup, and smoke test. Verified working with Kimi Code and Tencent WorkBuddy;
@@ -100,9 +102,8 @@ Clean copy + tracked-changes copy + change report + (optional) visual self-check
 materials, contracts, legal opinions, consulting reports, theses, press releases,
 notices, work plans.
 
-**Not covered** (left untouched, never corrupted): table-centric documents
-(rosters, price sheets), cover pages, headers/footers, tables of contents,
-multi-column layouts.
+**Not covered** (left untouched, never corrupted): cover-page design.
+Table content is preserved as-is on table-centric documents (rosters, price sheets).
 
 ## Related
 
