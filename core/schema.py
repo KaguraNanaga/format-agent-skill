@@ -76,6 +76,22 @@ def validate_spec(spec):
                 if v is not None and v not in ALIGNMENTS:
                     errors.append(f"page.{hf}.alignment={v!r} 非法：必须是 {sorted(ALIGNMENTS)} 之一")
 
+            # 多栏（可选）：page.columns = 栏数（论文双栏常见）
+            columns = page.get("columns")
+            if columns is not None and (not isinstance(columns, int) or not (1 <= columns <= 4)):
+                errors.append(f"page.columns={columns!r} 非法：必须是 1~4 的整数")
+
+    # ---- toc（可选）：目录。enabled + levels（收录的标题级别）----
+    toc = spec.get("toc")
+    if toc is not None:
+        if not isinstance(toc, dict):
+            errors.append("toc 必须是 object")
+        else:
+            lv = toc.get("levels")
+            if lv is not None and (not isinstance(lv, list)
+                                   or any(not isinstance(x, int) or not (1 <= x <= 3) for x in lv)):
+                errors.append(f"toc.levels={lv!r} 非法：必须是 [1,2,3] 子集")
+
     # ---- table（可选）：表格排版规则 ----
     table = spec.get("table")
     if table is not None:

@@ -125,6 +125,90 @@ def _apply_table_rule(doc, table_rule):
     return ["table_format"] if changed else []
 
 
+
+def _apply_columns(doc, num_cols, before_element=None):
+    """多栏排版：before_element（w:p 元素）之后的内容进入多栏（连续分节符切分）。
+    before_element 为 None 时整篇多栏。"""
+    import copy
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    if not isinstance(num_cols, int) or num_cols < 2:
+        return False
+    final_sect = doc.sections[0]._sectPr
+    if before_element is not None:
+        # 在切分点前的段落上插入单栏的段落级 sectPr（该段成为第一节的结尾）
+        first_sect = copy.deepcopy(final_sect)
+        cols = first_sect.find(qn("w:cols"))
+        if cols is None:
+            cols = OxmlElement("w:cols")
+            doc_grid = first_sect.find(qn("w:docGrid"))
+            if doc_grid is not None:
+                first_sect.insert(list(first_sect).index(doc_grid), cols)
+            else:
+                first_sect.append(cols)
+        cols.set(qn("w:num"), "1")
+        ppr = before_element.find(qn("w:pPr"))
+        if ppr is None:
+            ppr = OxmlElement("w:pPr")
+            before_element.insert(0, ppr)
+        ppr.append(first_sect)
+    cols = final_sect.find(qn("w:cols"))
+    if cols is None:
+        cols = OxmlElement("w:cols")
+        doc_grid = final_sect.find(qn("w:docGrid"))
+        if doc_grid is not None:
+            final_sect.insert(list(final_sect).index(doc_grid), cols)
+        else:
+            final_sect.append(cols)
+    cols.set(qn("w:num"), str(num_cols))
+    return True
+
+
+def _insert_toc(doc, before_paragraph, levels=(1, 2)):
+    """在 before_paragraph 前插入目录标题 + TOC 域。Word 打开后更新域即生成目录。"""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    def _new_para():
+        p = OxmlElement("w:p")
+        before_paragraph._p.addprevious(p)
+        return p
+
+    # 目录标题段
+    title_p = _new_para()
+    r = OxmlElement("w:r")
+    t = OxmlElement("w:t")
+    t.text = "目录"
+    r.append(t)
+    title_p.append(r)
+
+    # TOC 域
+    lvl = "-".join(str(x) for x in sorted(levels))
+    field_p = _new_para()
+
+    def _fld(kind):
+        el = OxmlElement("w:fldChar")
+        el.set(qn("w:fldCharType"), kind)
+        return el
+
+    r1 = OxmlElement("w:r"); r1.append(_fld("begin"))
+    r2 = OxmlElement("w:r")
+    instr = OxmlElement("w:instrText")
+    instr.set(qn("xml:space"), "preserve")
+    instr.text = 'TOC \\o "1-%d" \\h \\z \\u' % max(levels)
+    r2.append(instr)
+    r3 = OxmlElement("w:r"); r3.append(_fld("separate"))
+    r4 = OxmlElement("w:r")
+    t4 = OxmlElement("w:t")
+    t4.text = "（在 Word 中右键此处选择「更新域」生成目录）"
+    r4.append(t4)
+    r5 = OxmlElement("w:r"); r5.append(_fld("end"))
+    for r in (r1, r2, r3, r4, r5):
+        field_p.append(r)
+    return True
+
+
 def apply_format(docx_path, spec, rolemap, out_path, track=False):
     """应用 FormatSpec × RoleMap，输出 docx，返回 changelog list[dict]。
     rolemap: {idx: role}（idx 对应 extract.py 的段落序号）。
@@ -161,7 +245,6 @@ def apply_format(docx_path, spec, rolemap, out_path, track=False):
     extra_changes = []
     extra_changes.extend(_apply_header_footer(doc, page))
     extra_changes.extend(_apply_table_rule(doc, spec.get("table")))
-
     # ---- 段落级 ----
     changelog = []
     rev_id = 1
@@ -195,12 +278,45 @@ def apply_format(docx_path, spec, rolemap, out_path, track=False):
             "fallback_to_target_body": fallback_to_target_body,
         })
 
+    # ---- 目录 + 多栏（结构级，在段落样式完成后执行）----
+    toc = spec.get("toc") or {}
+    columns = page.get("columns")
+    want_toc = isinstance(toc, dict) and toc.get("enabled")
+    want_cols = isinstance(columns, int) and columns >= 2
+    if want_toc or want_cols:
+        first_heading = None
+        for idx, p in enumerate(doc.paragraphs):
+            r = rolemap.get(idx, rolemap.get(str(idx)))
+            if r in ("heading_1", "heading_2", "heading_3"):
+                first_heading = p
+                break
+        if want_toc and first_heading is not None:
+            # 目录要能收录我们的命名样式标题：强制补大纲级别
+            from docx.oxml import OxmlElement
+            from docx.oxml.ns import qn as _qn
+            for role, lvl in (("heading_1", "0"), ("heading_2", "1"), ("heading_3", "2")):
+                style = role_styles.get(role)
+                if style is None:
+                    continue
+                ppr = style.element.get_or_add_pPr()
+                if ppr.find(_qn("w:outlineLvl")) is None:
+                    ol = OxmlElement("w:outlineLvl")
+                    ol.set(_qn("w:val"), lvl)
+                    ppr.append(ol)
+            _insert_toc(doc, first_heading, levels=toc.get("levels") or (1, 2))
+            extra_changes.append("toc_inserted")
+        if want_cols:
+            # 多栏从第一个标题开始（标题/副标题/摘要保持单栏，符合论文惯例）
+            before_el = first_heading._p.getprevious() if first_heading is not None else None
+            if _apply_columns(doc, columns, before_element=before_el):
+                extra_changes.append(f"columns_{columns}")
+
     if extra_changes:
         changelog.append({
             "idx": -1,
             "role": "page",
             "style_name": "-",
-            "text": "页眉页脚/表格（页面级）",
+            "text": "页眉页脚/表格/目录/多栏（页面级）",
             "changed_fields": extra_changes,
             "fallback_to_target_body": False,
         })

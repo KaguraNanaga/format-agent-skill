@@ -290,7 +290,25 @@ def _page_section(doc):
     doc_grid = s._sectPr.find(qn("w:docGrid"))
     if doc_grid is not None and doc_grid.get(qn("w:linePitch")):
         page["line_grid"] = {"line_pt": round(int(doc_grid.get(qn("w:linePitch"))) / 20, 1)}
+    # 多栏（论文双栏等）
+    cols = s._sectPr.find(qn("w:cols"))
+    if cols is not None and cols.get(qn("w:num")):
+        try:
+            num = int(cols.get(qn("w:num")))
+            if num >= 2:
+                page["columns"] = num
+        except ValueError:
+            pass
     return page
+
+
+def _has_toc(doc):
+    """模板里是否有目录域（TOC field）。"""
+    body = doc.element.body
+    for el in body.iter(qn("w:instrText")):
+        if "TOC" in (el.text or ""):
+            return True
+    return False
 
 
 def _header_footer_rules(doc):
@@ -432,6 +450,8 @@ def extract_rules_from_template(template_path, rolemap):
     table_rule = _table_rule(doc)
     if table_rule:
         spec["table"] = table_rule
+    if _has_toc(doc):
+        spec["toc"] = {"enabled": True, "levels": [1, 2]}
     # 行网格一致性：模板里的 docGrid 常是 Word 默认值（如 15.6pt），与正文实际
     # 固定行距不一致时，网格会干扰排版。正文有明确固定行距时，以正文行距为准。
     body_ls = (roles.get("body") or {}).get("line_spacing") or {}
