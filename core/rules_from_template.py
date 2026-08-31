@@ -277,16 +277,25 @@ def _para_spacing_pt(p, attr):
 
 
 def _page_section(doc):
+    """页面级设置。多节文档取"主流边距"：封面/扉页节的边距常为 0 或极小，
+    不能代表正文版心——从所有节里取合法边距（四边均 >=5mm）中出现最多的。"""
     page = {}
     s = doc.sections[0]
-    margin = {
-        "top_mm": round(s.top_margin.mm, 1),
-        "bottom_mm": round(s.bottom_margin.mm, 1),
-        "left_mm": round(s.left_margin.mm, 1),
-        "right_mm": round(s.right_margin.mm, 1),
-    }
-    if all(v is not None for v in margin.values()):
-        page["margin"] = margin
+    margins = []
+    for sec in doc.sections:
+        m = (
+            round(sec.top_margin.mm, 1) if sec.top_margin is not None else None,
+            round(sec.bottom_margin.mm, 1) if sec.bottom_margin is not None else None,
+            round(sec.left_margin.mm, 1) if sec.left_margin is not None else None,
+            round(sec.right_margin.mm, 1) if sec.right_margin is not None else None,
+        )
+        if all(v is not None and v >= 5 for v in m):
+            margins.append(m)
+    if margins:
+        from collections import Counter
+        top, bottom, left, right = Counter(margins).most_common(1)[0][0]
+        page["margin"] = {"top_mm": top, "bottom_mm": bottom,
+                          "left_mm": left, "right_mm": right}
     doc_grid = s._sectPr.find(qn("w:docGrid"))
     if doc_grid is not None and doc_grid.get(qn("w:linePitch")):
         page["line_grid"] = {"line_pt": round(int(doc_grid.get(qn("w:linePitch"))) / 20, 1)}
@@ -300,6 +309,8 @@ def _page_section(doc):
         except ValueError:
             pass
     return page
+
+
 
 
 def _has_toc(doc):
