@@ -6,8 +6,10 @@
 
 from copy import deepcopy
 from io import BytesIO
+import re
 import zipfile
 
+from docx import Document
 from docx.enum.section import WD_SECTION
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -18,6 +20,43 @@ from docx.shared import Mm, Pt
 
 _FRONT_HEADING = "摘　要"
 _TOC_HEADING = "目　录"
+
+_COVER_LABELS = {
+    "姓名": "姓名", "学生姓名": "姓名", "作者": "姓名",
+    "学号": "学号", "学生学号": "学号",
+    "导师": "导师", "指导教师": "导师", "指导老师": "导师",
+    "院系": "院系", "学院": "院系", "所在学院": "院系",
+    "专业": "学科/专业", "学科": "学科/专业", "学科专业": "学科/专业",
+    "申请学位": "申请学位", "学位": "申请学位",
+}
+
+
+def _canonical_cover_label(value):
+    compact = re.sub(r"[\s：:]", "", value or "")
+    return _COVER_LABELS.get(compact)
+
+
+def extract_cover_metadata(docx_path):
+    """从目标稿的显式标签或两列表格保守提取封面元数据。"""
+    document = Document(docx_path)
+    result = {}
+    for paragraph in document.paragraphs:
+        match = re.match(r"^\s*([^：:]{1,12})[：:]\s*(.+?)\s*$", paragraph.text)
+        if not match:
+            continue
+        label = _canonical_cover_label(match.group(1))
+        value = match.group(2).strip()
+        if label and value and "待填写" not in value:
+            result.setdefault(label, value)
+    for table in document.tables:
+        for row in table.rows:
+            if len(row.cells) < 2:
+                continue
+            label = _canonical_cover_label(row.cells[0].text)
+            value = row.cells[1].text.strip()
+            if label and value and "待填写" not in value:
+                result.setdefault(label, value)
+    return result
 
 
 def _role_for_index(rolemap, index):
@@ -213,17 +252,41 @@ def _style_for_role(document, spec, role):
 
 
 def _extract_logo(template_path):
+    """按版面中的近方形、小尺寸图片选择校徽；无法判断时不猜。"""
     if not template_path:
         return None
     try:
-        with zipfile.ZipFile(template_path) as archive:
-            names = sorted(
-                name for name in archive.namelist()
-                if name.startswith("word/media/")
-                and name.lower().endswith((".png", ".jpg", ".jpeg"))
-            )
-            return archive.read(names[0]) if names else None
-    except (OSError, KeyError, zipfile.BadZipFile):
+        template = Document(template_path)
+        candidates = []
+        for order, shape in enumerate(template.inline_shapes):
+            blips = shape._inline.xpath(".//a:blip")
+            if not blips:
+                continue
+            relationship_id = blips[0].get(qn("r:embed"))
+            part = template.part.related_parts.get(relationship_id)
+            if part is None or not getattr(part, "blob", None):
+                continue
+            width_mm = shape.width.mm
+            height_mm = shape.height.mm
+            ratio = width_mm / height_mm if height_mm else 99
+            square_penalty = abs(ratio - 1)
+            size_penalty = 0 if 12 <= max(width_mm, height_mm) <= 65 else 2
+            candidates.append((square_penalty + size_penalty + order * 0.02, part.blob))
+        if candidates:
+            score, blob = min(candidates, key=lambda item: item[0])
+            return blob if score < 1.25 else None
+        # 浮动图片没有 inline_shape 尺寸时，仅在包内存在唯一近方形图片时采用。
+        package_candidates = []
+        for part in template.part.package.parts:
+            image = getattr(part, "image", None)
+            if image is None or not getattr(part, "blob", None):
+                continue
+            width = getattr(image, "px_width", 0)
+            height = getattr(image, "px_height", 0)
+            if width and height and abs(width / height - 1) <= 0.2:
+                package_candidates.append(part.blob)
+        return package_candidates[0] if len(package_candidates) == 1 else None
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
         return None
 
 
@@ -414,7 +477,8 @@ def _configure_sections(document, kinds, spec, first_chapter_text):
                 section, numbering.get("body_format", "decimal"), None)
 
 
-def assemble_thesis_structure(document, spec, rolemap, template_path=None):
+def assemble_thesis_structure(document, spec, rolemap, template_path=None,
+                              allow_risky_structure=False):
     """在已经完成命名样式排版的文档上组装论文结构。
 
     返回用于 changelog/文本一致性校验的结构化结果。
@@ -422,10 +486,19 @@ def assemble_thesis_structure(document, spec, rolemap, template_path=None):
     structure = spec.get("structure") or {}
     if not structure.get("enabled") or structure.get("mode") != "thesis":
         return None
+    if len(document.sections) > 1 and not allow_risky_structure:
+        raise ValueError(
+            "源文档已有多个分节；默认拒绝为论文结构删除或重排原分节")
 
-    original_paragraphs = list(document.paragraphs)
+    from core.extract import iter_main_paragraphs
+    indexed_paragraphs = [
+        (index, paragraph)
+        for index, (paragraph, depth) in enumerate(iter_main_paragraphs(document))
+        if depth == 0
+    ]
+    original_paragraphs = [paragraph for _, paragraph in indexed_paragraphs]
     role_paragraphs = {}
-    for index, paragraph in enumerate(original_paragraphs):
+    for index, paragraph in indexed_paragraphs:
         role = _role_for_index(rolemap, index)
         if role:
             role_paragraphs.setdefault(role, []).append(paragraph)

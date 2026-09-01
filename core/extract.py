@@ -4,15 +4,26 @@
 # in_table=True 的段落 v1 不参与重排，但仍列出（供角色标注参考上下文）。
 
 import re
+import zipfile
+from xml.etree import ElementTree as ET
 
 from docx import Document
+from docx.document import Document as _Document
+from docx.oxml.table import CT_Tbl
+from docx.oxml.text.paragraph import CT_P
 from docx.oxml.ns import qn
+from docx.table import Table, _Cell
+from docx.text.paragraph import Paragraph
 
 from core.effective_props import effective_props, get_paragraph_effective_font
 
 _ALIGN_MAP = {0: "left", 1: "center", 2: "right", 3: "justify"}
 
 _SENTENCE_ENDINGS = ("。", "；", ";", "！", "!", "？", "?", "，", ",", "：", ":")
+
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_M_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+_XML_NS = {"w": _W_NS, "m": _M_NS}
 
 # 先匹配 1.2 / 1.2.1，再匹配 1. / 2、，避免把 1.2 误拆成 "1." 。
 # 层级数字后必须有空白或标点，因此“1.2万元”不会被当成列表前缀。
@@ -193,7 +204,7 @@ def _spacing_pt(paragraph):
     return sb, sa
 
 
-def _para_record(idx, p, in_table):
+def _para_record(idx, p, in_table, table_depth=0):
     eastasia, size_pt, bold = get_paragraph_effective_font(p)
     character = effective_props(p)
     sb, sa = _spacing_pt(p)
@@ -212,8 +223,14 @@ def _para_record(idx, p, in_table):
         "char_count": len(full_text),
         "ends_with_sentence_punct": full_text.endswith(_SENTENCE_ENDINGS),
         "size_pt": size_pt,
+        "font_ascii": character.get("ascii"),
+        "font_cs": character.get("cs"),
+        "language": character.get("language"),
         "bold": bold,
         "italic": bool(character.get("italic")),
+        "caps": bool(character.get("caps")),
+        "small_caps": bool(character.get("small_caps")),
+        "rtl": bool(character.get("rtl")),
         "underline": bool(character.get("underline")),
         "color": character.get("color"),
         "alignment": _alignment_name(p),
@@ -226,6 +243,20 @@ def _para_record(idx, p, in_table):
         "space_before_pt": sb,
         "space_after_pt": sa,
         "in_table": in_table,
+        "table_depth": table_depth,
+        "story": "main",
+        "editable": not in_table,
+        "has_drawing": bool(
+            p._p.findall(".//" + qn("w:drawing"))
+            or p._p.findall(".//" + qn("w:pict"))),
+        "has_floating_drawing": bool(
+            p._p.findall(".//" + qn("wp:anchor"))),
+        "has_textbox": bool(p._p.findall(".//" + qn("w:txbxContent"))),
+        "has_content_control": bool(p._p.findall(".//" + qn("w:sdt"))),
+        "has_field": bool(
+            p._p.findall(".//" + qn("w:instrText"))
+            or p._p.findall(".//" + qn("w:fldSimple"))),
+        "has_math": bool(p._p.findall(f".//{{{_M_NS}}}oMath")),
     }
     record.update(numbering)
     record.update(_direct_indent(p))
@@ -267,21 +298,168 @@ def _annotate_list_sequences(records):
             current["list_sequence"] = True
 
 
-def extract_paragraphs(docx_path):
-    """返回段落清单 list[dict]，idx 为全文段落序号（含表格内段落）。"""
+def _iter_block_items(parent):
+    """按 OOXML 顺序产出父容器的直接段落和表格。"""
+    if isinstance(parent, _Document):
+        parent_element = parent.element.body
+    elif isinstance(parent, _Cell):
+        parent_element = parent._tc
+    else:
+        raise TypeError(f"不支持的 Word 容器：{type(parent)!r}")
+    for child in parent_element.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            yield Table(child, parent)
+
+
+def iter_main_paragraphs(document):
+    """按正文真实阅读顺序产出 ``(paragraph, table_depth)``。
+
+    表格保持在正文中的原位置，递归包含嵌套表格；合并单元格对应的同一
+    ``w:tc`` 只遍历一次。
+    """
+    def walk(container, depth):
+        for block in _iter_block_items(container):
+            if isinstance(block, Paragraph):
+                yield block, depth
+                continue
+            seen_cells = set()
+            for row in block.rows:
+                for cell in row.cells:
+                    # Keep the lxml element itself alive. Using ``id(cell._tc)``
+                    # is unsafe because python-docx may create short-lived proxy
+                    # wrappers and CPython can reuse their ids within this loop.
+                    cell_element = cell._tc
+                    if cell_element in seen_cells:
+                        continue
+                    seen_cells.add(cell_element)
+                    yield from walk(cell, depth + 1)
+
+    yield from walk(document, 0)
+
+
+def _xml_text(element, *, deleted=False):
+    tag = "w:delText" if deleted else "w:t"
+    return "".join(node.text or "" for node in element.findall(f".//{tag}", _XML_NS)).strip()
+
+
+def _story_record(idx, text, story, part, **flags):
+    value = re.sub(r"\s+", " ", text or "").strip()
+    record = {
+        "idx": idx,
+        "text": value[:80],
+        "char_count": len(value),
+        "ends_with_sentence_punct": value.endswith(_SENTENCE_ENDINGS),
+        "in_table": False,
+        "table_depth": 0,
+        "story": story,
+        "story_part": part,
+        "editable": False,
+        "list_kind": "none",
+        "list_sequence": False,
+    }
+    record.update(flags)
+    return record
+
+
+def _protected_story_records(docx_path, start_idx):
+    """抽取非正文 Story 的可见文字，供预检、宿主 Agent 和审计报告使用。"""
+    records = []
+    with zipfile.ZipFile(docx_path) as archive:
+        names = set(archive.namelist())
+        story_parts = []
+        for name in sorted(names):
+            if name.startswith("word/header") and name.endswith(".xml"):
+                story_parts.append((name, "header"))
+            elif name.startswith("word/footer") and name.endswith(".xml"):
+                story_parts.append((name, "footer"))
+            elif name == "word/footnotes.xml":
+                story_parts.append((name, "footnote"))
+            elif name == "word/endnotes.xml":
+                story_parts.append((name, "endnote"))
+            elif name == "word/comments.xml":
+                story_parts.append((name, "comment"))
+            elif name == "word/document.xml":
+                story_parts.append((name, "main_auxiliary"))
+
+        for part_name, default_story in story_parts:
+            root = ET.fromstring(archive.read(part_name))
+            excluded_paragraphs = set()
+            excluded_note_paragraphs = set()
+            if default_story in {"footnote", "endnote"}:
+                item_tag = "w:footnote" if default_story == "footnote" else "w:endnote"
+                for item in root.findall(f".//{item_tag}", _XML_NS):
+                    item_type = item.get(f"{{{_XML_NS['w']}}}type")
+                    item_id = item.get(f"{{{_XML_NS['w']}}}id")
+                    try:
+                        internal = item_id is not None and int(item_id) <= 0
+                    except ValueError:
+                        internal = False
+                    if item_type in {"separator", "continuationSeparator"} or internal:
+                        excluded_note_paragraphs.update(
+                            item.findall(".//w:p", _XML_NS))
+            for textbox in root.findall(".//w:txbxContent", _XML_NS):
+                for paragraph in textbox.findall(".//w:p", _XML_NS):
+                    excluded_paragraphs.add(paragraph)
+                    text = _xml_text(paragraph)
+                    if text:
+                        records.append(_story_record(
+                            start_idx + len(records), text, "textbox", part_name,
+                            has_textbox=True))
+            for control in root.findall(".//w:sdt", _XML_NS):
+                for paragraph in control.findall(".//w:p", _XML_NS):
+                    if paragraph in excluded_paragraphs:
+                        continue
+                    excluded_paragraphs.add(paragraph)
+                    text = _xml_text(paragraph)
+                    if text:
+                        records.append(_story_record(
+                            start_idx + len(records), text, "content_control",
+                            part_name, has_content_control=True))
+
+            if default_story == "main_auxiliary":
+                for wrapper, story, deleted in (
+                    ("w:ins", "revision_insert", False),
+                    ("w:del", "revision_delete", True),
+                    ("w:moveFrom", "revision_move_from", True),
+                    ("w:moveTo", "revision_move_to", False),
+                ):
+                    for element in root.findall(f".//{wrapper}", _XML_NS):
+                        text = _xml_text(element, deleted=deleted)
+                        if text:
+                            records.append(_story_record(
+                                start_idx + len(records), text, story, part_name,
+                                has_revision=True))
+                continue
+
+            for paragraph in root.findall(".//w:p", _XML_NS):
+                if (
+                    paragraph in excluded_paragraphs
+                    or paragraph in excluded_note_paragraphs
+                ):
+                    continue
+                text = _xml_text(paragraph)
+                if text:
+                    records.append(_story_record(
+                        start_idx + len(records), text, default_story,
+                        part_name))
+    return records
+
+
+def extract_paragraphs(docx_path, include_protected_stories=True):
+    """返回按阅读顺序排列的段落清单。
+
+    正文与嵌套表格保持真实 OOXML 顺序；受保护 Story 追加为
+    ``editable=False`` 的审计记录，不送角色排版。
+    """
     doc = Document(docx_path)
     out = []
-    for idx, p in enumerate(doc.paragraphs):
-        out.append(_para_record(idx, p, False))
-    # 表格段落追加在末尾（doc.paragraphs 不含表格内段落，单独列出）
-    idx = len(out)
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for p in cell.paragraphs:
-                    out.append(_para_record(idx, p, True))
-                    idx += 1
+    for idx, (paragraph, depth) in enumerate(iter_main_paragraphs(doc)):
+        out.append(_para_record(idx, paragraph, depth > 0, depth))
     _annotate_list_sequences(out)
+    if include_protected_stories:
+        out.extend(_protected_story_records(docx_path, len(out)))
     return out
 
 

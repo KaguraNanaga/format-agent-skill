@@ -4,6 +4,8 @@
 # 未知/读不到的字段不编——留给 LLM 规范抽取或人肉 JSON 补。
 
 from copy import deepcopy
+import json
+import re
 
 from docx import Document
 from docx.enum.text import WD_LINE_SPACING
@@ -11,6 +13,7 @@ from docx.oxml.ns import qn
 
 from core.effective_props import effective_props
 from core.extract import manual_number_prefix, paragraph_numbering_metadata
+from core.profiles import detect_profile_from_texts
 from core.schema import validate_spec
 
 _ALIGN_MAP = {0: "left", 1: "center", 2: "right", 3: "justify"}
@@ -204,7 +207,9 @@ def _is_numbered_body_candidate(paragraph):
 
 
 def _representative_paragraphs(paragraphs, rolemap):
-    """按角色选代表段；body 优先选普通正文，避免列表特例污染全局规则。"""
+    """按角色选主流格式代表段，避免首段或短标签 Run 污染全局规则。"""
+    from collections import Counter
+
     candidates = {}
     for idx, role in sorted(rolemap.items()):
         if 0 <= idx < len(paragraphs):
@@ -212,13 +217,26 @@ def _representative_paragraphs(paragraphs, rolemap):
     representatives = {}
     for role, role_paragraphs in candidates.items():
         if role == "body":
-            preferred = [
+            role_paragraphs = [
                 paragraph for paragraph in role_paragraphs
                 if paragraph.text.strip() and not _is_numbered_body_candidate(paragraph)
-            ]
-            representatives[role] = (preferred or role_paragraphs)[0]
-        else:
-            representatives[role] = role_paragraphs[0]
+            ] or role_paragraphs
+        signatures = []
+        for paragraph in role_paragraphs:
+            props = effective_props(paragraph)
+            signatures.append((
+                paragraph.style.style_id if paragraph.style is not None else None,
+                props.get("eastasia"), props.get("ascii"), props.get("cs"),
+                props.get("size_pt"), props.get("bold"), props.get("italic"),
+                _para_alignment(paragraph),
+            ))
+        dominant = Counter(signatures).most_common(1)[0][0]
+        matching = [
+            paragraph for paragraph, signature in zip(role_paragraphs, signatures)
+            if signature == dominant
+        ]
+        representatives[role] = max(
+            matching, key=lambda paragraph: len(paragraph.text.strip()))
     return representatives
 
 
@@ -295,9 +313,16 @@ def _paragraph_rule(doc, p, role):
     }
     if props.get("ascii"):
         rule["font_ascii"] = props["ascii"]
-    for field in ("italic", "underline", "strike"):
+    if props.get("cs"):
+        rule["font_cs"] = props["cs"]
+    if props.get("language"):
+        rule["language"] = props["language"]
+    for field in ("italic", "underline", "strike", "caps", "small_caps", "rtl"):
         if props.get(field) is not None:
             rule[field] = bool(props[field])
+    bidi = _ppr_toggle(p, "w:bidi")
+    if bidi is not None:
+        rule["bidi"] = bidi
     for field in ("color", "highlight"):
         if props.get(field) is not None:
             rule[field] = props[field]
@@ -331,15 +356,24 @@ def _paragraph_rule(doc, p, role):
 
 
 def _detect_profile(doc):
-    texts = [p.text.strip().replace(" ", "") for p in doc.paragraphs if p.text.strip()]
-    signals = sum((
-        any(text == "摘要" or text.startswith("摘要：") for text in texts),
-        any(text.startswith(("关键词：", "关键字：")) for text in texts),
-        any(text == "参考文献" for text in texts),
-    ))
-    if any("学位论文" in text or "毕业论文" in text for text in texts):
-        signals += 2
-    return "thesis" if signals >= 2 else "general"
+    return detect_profile_from_texts(
+        p.text.strip() for p in doc.paragraphs if p.text.strip())
+
+
+def _cleanup_mode_for_template(doc, profile):
+    if profile in {
+        "english_academic", "english_legal", "english_technical",
+        "english_legal_brief",
+    }:
+        return "preserve_emphasis"
+    if profile == "thesis":
+        text = " ".join(paragraph.text for paragraph in doc.paragraphs)
+        latin = len(re.findall(r"[A-Za-z]", text))
+        cjk = len(re.findall(r"[\u3400-\u9fff]", text))
+        if latin >= 50 and latin >= max(1, round(cjk * 0.1)):
+            return "preserve_emphasis"
+        return "strict"
+    return "controlled"
 
 
 def _section_page_numbering(section):
@@ -427,7 +461,7 @@ def _first_paragraph(doc, predicate):
     return next((p for p in doc.paragraphs if predicate(p.text.strip().replace(" ", ""))), None)
 
 
-def _add_thesis_roles(doc, roles):
+def _add_thesis_roles(doc, roles, english=False):
     """把通用模板样式扩展成论文语义角色，并加入分页/段落连续性约束。"""
     body = deepcopy(roles["body"])
     heading_1 = deepcopy(roles.get("heading_1") or body)
@@ -437,17 +471,38 @@ def _add_thesis_roles(doc, roles):
         if role in roles:
             roles[role]["keep_with_next"] = True
             roles[role]["keep_together"] = True
-    if "heading_1" in roles:
+    if "heading_1" in roles and not english:
         roles["heading_1"]["page_break_before"] = True
 
-    chapter = deepcopy(heading_1)
+    chapter_paragraph = None
+    if english:
+        academic_sections = {
+            "introduction", "literaturereview", "relatedwork", "method",
+            "methods", "methodology", "results", "discussion",
+            "conclusion", "conclusions", "acknowledgments",
+            "acknowledgements",
+        }
+        chapter_paragraph = _first_paragraph(
+            doc,
+            lambda text: (
+                text.lower() in academic_sections
+                or text.lower().startswith("chapter")
+            ),
+        )
+    chapter = (
+        _paragraph_rule(doc, chapter_paragraph, "chapter_heading")
+        if chapter_paragraph is not None else deepcopy(heading_1)
+    )
     chapter.update({
-        "keep_with_next": True, "keep_together": True,
-        "page_break_before": True, "outline_level": 0,
+        "keep_with_next": True, "keep_together": True, "outline_level": 0,
     })
+    if not english:
+        chapter["page_break_before"] = True
     roles["chapter_heading"] = chapter
 
-    abstract_heading_p = _first_paragraph(doc, lambda text: text == "摘要")
+    abstract_heading_p = _first_paragraph(
+        doc, (lambda text: text.lower() == "abstract") if english
+        else (lambda text: text == "摘要"))
     abstract_heading = (
         _paragraph_rule(doc, abstract_heading_p, "abstract_heading")
         if abstract_heading_p is not None else deepcopy(heading_1)
@@ -460,7 +515,8 @@ def _add_thesis_roles(doc, roles):
     abstract_body.pop("numbering", None)
     abstract_body["first_line_indent_chars"] = 0
     abstract_body["label_prefix"] = {
-        "text": ["摘要：", "摘要:"], "bold": True,
+        "text": ["Abstract:", "Abstract："] if english else ["摘要：", "摘要:"],
+        "bold": True,
     }
     roles["abstract_body"] = abstract_body
 
@@ -468,19 +524,25 @@ def _add_thesis_roles(doc, roles):
     keywords.pop("numbering", None)
     keywords["first_line_indent_chars"] = 0
     keywords["label_prefix"] = {
-        "text": ["关键词：", "关键词:", "关键字：", "关键字:"], "bold": True,
+        "text": ["Keywords:", "Keyword:", "Keywords：", "Keyword："]
+        if english else ["关键词：", "关键词:", "关键字：", "关键字:"],
+        "bold": True,
     }
     roles["keywords"] = keywords
 
-    bibliography_heading_p = _first_paragraph(doc, lambda text: text == "参考文献")
+    bibliography_heading_p = _first_paragraph(
+        doc,
+        (lambda text: text.lower() in {"references", "bibliography", "workscited"})
+        if english else (lambda text: text == "参考文献"))
     bibliography_heading = (
         _paragraph_rule(doc, bibliography_heading_p, "bibliography_heading")
         if bibliography_heading_p is not None else deepcopy(heading_1)
     )
     bibliography_heading.update({
-        "keep_with_next": True, "keep_together": True,
-        "page_break_before": True, "outline_level": 0,
+        "keep_with_next": True, "keep_together": True, "outline_level": 0,
     })
+    if not english:
+        bibliography_heading["page_break_before"] = True
     roles["bibliography_heading"] = bibliography_heading
 
     bibliography_entry = deepcopy(roles.get("attachment") or body)
@@ -501,42 +563,84 @@ def _add_thesis_roles(doc, roles):
     appendix = deepcopy(chapter)
     roles["appendix_heading"] = appendix
 
+    for role in ("list_of_figures_heading", "list_of_tables_heading"):
+        list_heading = deepcopy(heading_1)
+        list_heading.update({
+            "keep_with_next": True, "keep_together": True,
+            "outline_level": 0,
+        })
+        if not english:
+            list_heading["page_break_before"] = True
+        roles[role] = list_heading
+
     if heading_2 is not None:
         heading_2.setdefault("keep_with_next", True)
 
 
-def _page_section(doc):
-    """页面级设置。多节文档取"主流边距"：封面/扉页节的边距常为 0 或极小，
-    不能代表正文版心——从所有节里取合法边距（四边均 >=5mm）中出现最多的。"""
-    page = {}
-    s = doc.sections[0]
-    margins = []
-    for sec in doc.sections:
-        m = (
-            round(sec.top_margin.mm, 1) if sec.top_margin is not None else None,
-            round(sec.bottom_margin.mm, 1) if sec.bottom_margin is not None else None,
-            round(sec.left_margin.mm, 1) if sec.left_margin is not None else None,
-            round(sec.right_margin.mm, 1) if sec.right_margin is not None else None,
+def _section_page_rule(section):
+    """提取单节纸张、边距、栏数和页码格式。"""
+    rule = {}
+    if section.page_width is not None and section.page_height is not None:
+        width = round(section.page_width.mm, 1)
+        height = round(section.page_height.mm, 1)
+        short, long = min(width, height), max(width, height)
+        for name, (wanted_short, wanted_long) in {
+            "A3": (297.0, 420.0),
+            "A4": (210.0, 297.0),
+            "A5": (148.0, 210.0),
+            "letter": (215.9, 279.4),
+            "legal": (215.9, 355.6),
+        }.items():
+            if abs(short - wanted_short) <= 1 and abs(long - wanted_long) <= 1:
+                rule["size"] = name
+                break
+        else:
+            rule["width_mm"] = short
+            rule["height_mm"] = long
+        rule["orientation"] = "landscape" if width > height else "portrait"
+    margins = {
+        key: round(getattr(section, attr).mm, 1)
+        for key, attr in (
+            ("top_mm", "top_margin"), ("bottom_mm", "bottom_margin"),
+            ("left_mm", "left_margin"), ("right_mm", "right_margin"),
         )
-        if all(v is not None and v >= 5 for v in m):
-            margins.append(m)
+        if getattr(section, attr) is not None
+        and 5 <= getattr(section, attr).mm <= 50
+    }
     if margins:
-        from collections import Counter
-        top, bottom, left, right = Counter(margins).most_common(1)[0][0]
-        page["margin"] = {"top_mm": top, "bottom_mm": bottom,
-                          "left_mm": left, "right_mm": right}
-    doc_grid = s._sectPr.find(qn("w:docGrid"))
-    if doc_grid is not None and doc_grid.get(qn("w:linePitch")):
-        page["line_grid"] = {"line_pt": round(int(doc_grid.get(qn("w:linePitch"))) / 20, 1)}
-    # 多栏（论文双栏等）
-    cols = s._sectPr.find(qn("w:cols"))
-    if cols is not None and cols.get(qn("w:num")):
-        try:
-            num = int(cols.get(qn("w:num")))
-            if num >= 2:
-                page["columns"] = num
-        except ValueError:
-            pass
+        rule["margin"] = margins
+    columns = section._sectPr.find(qn("w:cols"))
+    try:
+        number = int(columns.get(qn("w:num"), "1")) if columns is not None else 1
+    except ValueError:
+        number = 1
+    rule["columns"] = max(1, min(number, 4))
+    page_numbering = _section_page_numbering(section)
+    if page_numbering:
+        rule["page_numbering"] = page_numbering
+    return rule
+
+
+def _page_section(doc):
+    """单节输出全局规则；多节按索引保存各节契约，避免主流值覆盖特例。"""
+    section_rules = [_section_page_rule(section) for section in doc.sections]
+    if len(section_rules) == 1:
+        page = section_rules[0]
+        if page.get("columns") == 1:
+            page.pop("columns", None)
+    else:
+        page = {"section_overrides": [
+            {"section_index": index, **rule}
+            for index, rule in enumerate(section_rules)
+        ]}
+    line_pitches = []
+    for section in doc.sections:
+        doc_grid = section._sectPr.find(qn("w:docGrid"))
+        value = doc_grid.get(qn("w:linePitch")) if doc_grid is not None else None
+        line_pitches.append(value)
+    if line_pitches and len(set(line_pitches)) == 1 and line_pitches[0]:
+        page["line_grid"] = {
+            "line_pt": round(int(line_pitches[0]) / 20, 1)}
     return page
 
 
@@ -551,51 +655,175 @@ def _has_toc(doc):
     return False
 
 
+def _header_footer_story_rule(hf, *, represent_empty=False):
+    """读取一个页眉/页脚 Story；动态域不固化缓存文字。"""
+    try:
+        text_ps = [p for p in hf.paragraphs if p.text.strip()]
+    except Exception:
+        return None
+    instructions = [
+        (el.text or "").strip()
+        for el in hf._element.iter(qn("w:instrText"))
+        if (el.text or "").strip()
+    ]
+    has_page_field = any(
+        instruction.upper().split(" ", 1)[0] == "PAGE"
+        for instruction in instructions)
+    has_dynamic_text = any(
+        instruction.upper().split(" ", 1)[0] != "PAGE"
+        for instruction in instructions)
+    if not text_ps and not has_page_field and not represent_empty:
+        return None
+    rule = {}
+    if text_ps and not has_dynamic_text:
+        paragraph = text_ps[0]
+        rule["text"] = paragraph.text.strip()
+        props = effective_props(paragraph)
+        if props.get("eastasia"):
+            rule["font_eastasia"] = props["eastasia"]
+        if props.get("ascii"):
+            rule["font_ascii"] = props["ascii"]
+        if props.get("cs"):
+            rule["font_cs"] = props["cs"]
+        if props.get("language"):
+            rule["language"] = props["language"]
+        if props.get("rtl") is not None:
+            rule["rtl"] = bool(props["rtl"])
+        if props.get("size_pt"):
+            rule["size_pt"] = props["size_pt"]
+        if props.get("bold") is not None:
+            rule["bold"] = bool(props["bold"])
+        alignment = _para_alignment(paragraph)
+        if alignment:
+            rule["alignment"] = alignment
+    elif has_dynamic_text:
+        rule["preserve_text"] = True
+    elif represent_empty:
+        rule["text"] = ""
+    if has_page_field:
+        rule["page_number"] = True
+    return rule
+
+
 def _header_footer_rules(doc):
-    """读模板的页眉页脚：第一个非空段的文字 + 生效格式；页脚有 PAGE 域则记 page_number。"""
+    """读取所有节的默认/偶数页/首页 Story，并保留独立分节差异。"""
     rules = {}
-    s = doc.sections[0]
-    for which, hf in (("header", s.header), ("footer", s.footer)):
-        try:
-            text_ps = [p for p in hf.paragraphs if p.text.strip()]
-        except Exception:  # 无页眉页脚部件
-            continue
-        has_page_field = any(
-            "PAGE" in (el.text or "")
-            for el in hf._element.iter(qn("w:instrText")))
-        if not text_ps and not has_page_field:
-            continue
-        rule = {}
-        if text_ps:
-            p = text_ps[0]
-            rule["text"] = p.text.strip()
-            props = effective_props(p)
-            if props.get("eastasia"):
-                rule["font_eastasia"] = props["eastasia"]
-            if props.get("ascii"):
-                rule["font_ascii"] = props["ascii"]
-            if props.get("size_pt"):
-                rule["size_pt"] = props["size_pt"]
-            if props.get("bold") is not None:
-                rule["bold"] = bool(props["bold"])
-            a = _para_alignment(p)
-            if a:
-                rule["alignment"] = a
-        if which == "footer" and has_page_field:
-            rule["page_number"] = True
-        rules[which] = rule
+    variants = (
+        ("header", "header"), ("footer", "footer"),
+        ("even_header", "even_page_header"),
+        ("even_footer", "even_page_footer"),
+        ("first_header", "first_page_header"),
+        ("first_footer", "first_page_footer"),
+    )
+    if doc.settings.odd_and_even_pages_header_footer:
+        rules["different_odd_even"] = True
+    if doc.sections[0].different_first_page_header_footer:
+        rules["different_first_page"] = True
+    first = doc.sections[0]
+    for which, accessor in variants:
+        rule = _header_footer_story_rule(getattr(first, accessor))
+        if rule is not None:
+            rules[which] = rule
+
+    overrides = []
+    for section_index, section in enumerate(doc.sections[1:], start=1):
+        override = {"section_index": section_index}
+        if section.different_first_page_header_footer:
+            override["different_first_page"] = True
+        for which, accessor in variants:
+            story = getattr(section, accessor)
+            if story.is_linked_to_previous:
+                continue
+            rule = _header_footer_story_rule(story, represent_empty=True)
+            if rule is not None:
+                override[which] = rule
+        if len(override) > 1:
+            overrides.append(override)
+    if overrides:
+        rules["section_overrides"] = overrides
     return rules
 
 
-def _table_rule(doc):
-    """读模板第一张表：表头行格式（加粗/居中）+ 单元格字体字号 + 是否有边框。"""
-    if not doc.tables:
-        return None
-    t = doc.tables[0]
+def _merge_page_rules(base, additions):
+    result = deepcopy(base)
+    base_overrides = {
+        item["section_index"]: deepcopy(item)
+        for item in result.pop("section_overrides", [])
+    }
+    addition_overrides = additions.get("section_overrides") or []
+    for key, value in additions.items():
+        if key != "section_overrides":
+            result[key] = deepcopy(value)
+    for item in addition_overrides:
+        index = item["section_index"]
+        base_overrides.setdefault(index, {"section_index": index}).update(
+            deepcopy(item))
+    if base_overrides:
+        result["section_overrides"] = [
+            base_overrides[index] for index in sorted(base_overrides)
+        ]
+    return result
+
+
+def _table_rule_for_table(t):
+    """读取一张表的字体、几何、表头和跨页规则。"""
     rule = {}
+    table_alignment = t.alignment
+    if table_alignment is not None:
+        rule["alignment"] = {0: "left", 1: "center", 2: "right"}.get(
+            int(table_alignment), "left")
+    tbl_pr = t._tbl.tblPr
+    layout = tbl_pr.find(qn("w:tblLayout"))
+    if layout is not None and layout.get(qn("w:type")) in {"fixed", "autofit"}:
+        rule["layout"] = layout.get(qn("w:type"))
+        rule["autofit"] = rule["layout"] == "autofit"
+    width = tbl_pr.find(qn("w:tblW"))
+    if width is not None:
+        try:
+            raw_width = int(width.get(qn("w:w")))
+        except (TypeError, ValueError):
+            raw_width = None
+        if raw_width is not None and width.get(qn("w:type")) == "pct":
+            rule["width_pct"] = round(raw_width / 50, 2)
+        elif raw_width is not None and width.get(qn("w:type")) == "dxa" and raw_width > 0:
+            rule["preferred_width_mm"] = round(raw_width / 1440 * 25.4, 2)
+    grid_widths = []
+    for grid_column in t._tbl.tblGrid.findall(qn("w:gridCol")):
+        try:
+            grid_widths.append(int(grid_column.get(qn("w:w"))))
+        except (TypeError, ValueError):
+            grid_widths = []
+            break
+    if grid_widths and sum(grid_widths) > 0:
+        rule["column_widths_pct"] = [
+            round(value / sum(grid_widths) * 100, 2) for value in grid_widths]
+    margins = tbl_pr.find(qn("w:tblCellMar"))
+    if margins is not None:
+        values = {}
+        for edge in ("top", "bottom", "left", "right"):
+            element = margins.find(qn(f"w:{edge}"))
+            try:
+                values[edge] = round(int(element.get(qn("w:w"))) / 1440 * 25.4, 2)
+            except (AttributeError, TypeError, ValueError):
+                pass
+        if values:
+            rule["cell_margins_mm"] = values
     rows = t.rows
     if not rows:
         return None
+    first_tr_pr = rows[0]._tr.trPr
+    rule["repeat_header_row"] = bool(
+        first_tr_pr is not None
+        and first_tr_pr.find(qn("w:tblHeader")) is not None)
+    sample_tr_pr = rows[-1]._tr.trPr
+    rule["allow_row_break"] = not bool(
+        sample_tr_pr is not None
+        and sample_tr_pr.find(qn("w:cantSplit")) is not None)
+    vertical = rows[0].cells[0].vertical_alignment
+    if vertical is not None:
+        rule["vertical_alignment"] = {
+            0: "top", 1: "center", 3: "bottom",
+        }.get(int(vertical), "top")
     header_props = None
     for p in rows[0].cells[0].paragraphs:
         header_props = effective_props(p)
@@ -613,6 +841,12 @@ def _table_rule(doc):
             rule["font_eastasia"] = props["eastasia"]
         if props.get("ascii"):
             rule["font_ascii"] = props["ascii"]
+        if props.get("cs"):
+            rule["font_cs"] = props["cs"]
+        if props.get("language"):
+            rule["language"] = props["language"]
+        if props.get("rtl") is not None:
+            rule["rtl"] = bool(props["rtl"])
         if props.get("size_pt"):
             rule["size_pt"] = props["size_pt"]
         a = _para_alignment(p)
@@ -624,7 +858,7 @@ def _table_rule(doc):
         rule.setdefault("size_pt", header_props.get("size_pt") or 10.5)
 
     # 边框：直接 tblBorders 或表格样式（Table Grid 等）继承都算有边框
-    borders = t._tbl.tblPr.find(qn("w:tblBorders"))
+    borders = tbl_pr.find(qn("w:tblBorders"))
     if borders is not None:
         any_border = any(
             (el.get(qn("w:val")) or "single") not in ("none", "nil")
@@ -639,6 +873,31 @@ def _table_rule(doc):
         if "grid" in style_name or "网格" in style_name:
             rule["borders"] = True
     return rule or None
+
+
+def _table_rule(doc):
+    """提取模板中的主流表格规则，并为异构表格生成按索引覆盖。"""
+    if not doc.tables:
+        return None
+    rules = [_table_rule_for_table(table) or {} for table in doc.tables]
+    signatures = [
+        json.dumps(rule, ensure_ascii=False, sort_keys=True)
+        for rule in rules
+    ]
+    from collections import Counter
+    dominant_signature = Counter(signatures).most_common(1)[0][0]
+    dominant_index = signatures.index(dominant_signature)
+    result = deepcopy(rules[dominant_index])
+    overrides = []
+    for index, (rule, signature) in enumerate(zip(rules, signatures)):
+        if signature == dominant_signature:
+            continue
+        override = {"table_index": index}
+        override.update(deepcopy(rule))
+        overrides.append(override)
+    if overrides:
+        result["overrides"] = overrides
+    return result or None
 
 
 def extract_rules_from_template(template_path, rolemap):
@@ -656,19 +915,37 @@ def extract_rules_from_template(template_path, rolemap):
     if "body" not in roles:
         raise ValueError("模板中没有标注 body 角色的段落，无法确定正文格式")
     profile = _detect_profile(doc)
-    if profile == "thesis":
-        _add_thesis_roles(doc, roles)
+    if profile in {"thesis", "english_academic"}:
+        _add_thesis_roles(doc, roles, english=profile == "english_academic")
 
+    page_rule = _page_section(doc)
+    if profile == "thesis" and len(doc.sections) > 1:
+        # 论文结构模式会按封面/前置页/正文重新建节；以末节正文几何作为基线，
+        # 不把模板旧节索引强行映射到目标稿。
+        line_grid = page_rule.get("line_grid")
+        page_rule = _section_page_rule(doc.sections[-1])
+        page_rule.pop("page_numbering", None)
+        if page_rule.get("columns") == 1:
+            page_rule.pop("columns", None)
+        if line_grid:
+            page_rule["line_grid"] = line_grid
     spec = {
         "profile": profile,
-        "cleanup": {"mode": "strict" if profile == "thesis" else "controlled"},
-        "page": _page_section(doc),
+        "locale": "en-US" if profile.startswith("english_") else "zh-CN",
+        "cleanup": {
+            "mode": _cleanup_mode_for_template(doc, profile)
+        },
+        "page": page_rule,
         "roles": roles,
     }
     if profile == "thesis":
         spec["structure"] = _thesis_structure(doc)
     # 页眉页脚 + 表格规则（模板有就读，没有就不编）
-    spec["page"].update(_header_footer_rules(doc))
+    header_footer_rules = _header_footer_rules(doc)
+    if profile == "thesis":
+        header_footer_rules.pop("section_overrides", None)
+    spec["page"] = _merge_page_rules(
+        spec["page"], header_footer_rules)
     table_rule = _table_rule(doc)
     if table_rule:
         spec["table"] = table_rule

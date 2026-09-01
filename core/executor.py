@@ -12,7 +12,8 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
 
-def set_run_fonts(run, eastasia=None, ascii_font=None, size_pt=None, bold=None):
+def set_run_fonts(run, eastasia=None, ascii_font=None, complex_font=None,
+                  size_pt=None, bold=None, language=None, rtl=None):
     """设置 run 的中西文字体、字号、加粗。eastasia 是必须项，否则中文不生效。"""
     rpr = run._element.get_or_add_rPr()
     # 1) 字体（rFonts 各属性之间无顺序要求，OOXML 属性本就无序）
@@ -25,6 +26,8 @@ def set_run_fonts(run, eastasia=None, ascii_font=None, size_pt=None, bold=None):
         rfonts.set(qn("w:hAnsi"), ascii_font)
     if eastasia:
         rfonts.set(qn("w:eastAsia"), eastasia)
+    if complex_font:
+        rfonts.set(qn("w:cs"), complex_font)
     # 2) 字号 (pt -> half-points)，w:sz 与 w:szCs 一起设
     if size_pt is not None:
         for tag in ("w:sz", "w:szCs"):
@@ -46,6 +49,20 @@ def set_run_fonts(run, eastasia=None, ascii_font=None, size_pt=None, bold=None):
                     del b.attrib[qn("w:val")]  # 元素存在且无 val = 开
             else:
                 b.set(qn("w:val"), "0")
+    if language:
+        lang = rpr.find(qn("w:lang"))
+        if lang is None:
+            lang = OxmlElement("w:lang")
+            rpr.append(lang)
+        lang.set(qn("w:val"), language)
+        if rtl:
+            lang.set(qn("w:bidi"), language)
+    if rtl is not None:
+        element = rpr.find(qn("w:rtl"))
+        if element is None:
+            element = OxmlElement("w:rtl")
+            rpr.append(element)
+        element.set(qn("w:val"), "1" if rtl else "0")
 
 
 def set_paragraph_fixed_spacing(paragraph, line_pt=None, before_pt=None, after_pt=None):
@@ -120,14 +137,15 @@ def set_doc_grid(document, line_pt=28.0):
     所以这里只设 type 和 linePitch，不伪造 charSpace，也不动 w:cols。
     前提: 页边距与正文字号已按 FormatSpec 设置。
     """
-    section = document.sections[0]
-    sect_pr = section._sectPr
-    doc_grid = sect_pr.find(qn("w:docGrid"))
-    if doc_grid is None:
-        doc_grid = OxmlElement("w:docGrid")
-        sect_pr.append(doc_grid)
-    doc_grid.set(qn("w:type"), "linesAndChars")
-    doc_grid.set(qn("w:linePitch"), str(int(round(line_pt * 20))))
+    # 保留现有分节，只在每节自己的 sectPr 中更新网格。
+    for section in document.sections:
+        sect_pr = section._sectPr
+        doc_grid = sect_pr.find(qn("w:docGrid"))
+        if doc_grid is None:
+            doc_grid = OxmlElement("w:docGrid")
+            sect_pr.append(doc_grid)
+        doc_grid.set(qn("w:type"), "linesAndChars")
+        doc_grid.set(qn("w:linePitch"), str(int(round(line_pt * 20))))
 
 
 def _effective_font_size(paragraph):

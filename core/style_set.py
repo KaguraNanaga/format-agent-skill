@@ -29,6 +29,7 @@ ROLE_STYLE_NAMES = {
     "heading_1": "标题 1",
     "heading_2": "标题 2",
     "heading_3": "标题 3",
+    "heading_4": "标题 4",
     "body": "格式正文",
     "signature": "落款",
     "date": "日期",
@@ -44,6 +45,39 @@ ROLE_STYLE_NAMES = {
     "bibliography_entry": "参考文献条目",
     "equation": "公式",
     "appendix_heading": "附录标题",
+    "list_of_figures_heading": "图目录标题",
+    "list_of_tables_heading": "表目录标题",
+    "block_quote": "块引用",
+    "code_block": "代码块",
+    "byline": "作者署名",
+    "affiliation": "作者单位",
+    "author_note": "作者注",
+    "correspondence": "通信地址",
+    "salutation": "称呼",
+    "complimentary_close": "结尾敬语",
+    "cc": "抄送",
+    "enclosure": "附件说明",
+    "legal_definition": "定义条款",
+    "signature_block": "签署栏",
+    "table_of_authorities_heading": "引证表标题",
+    "recipient": "主送机关",
+    "closing": "公文结束语",
+    "document_number": "发文字号",
+    "copy_to": "抄送机关",
+    "warning_box": "警告框",
+    "caution_box": "注意框",
+    "note_box": "说明框",
+    "tip_box": "提示框",
+    "procedure_step": "操作步骤",
+    "command": "命令",
+    "court_caption": "法院标题",
+    "case_number": "案号",
+    "brief_title": "法律文书标题",
+    "table_of_contents_heading": "目录标题",
+    "authority_entry": "引证表条目",
+    "counsel_block": "律师信息",
+    "certificate_heading": "证明标题",
+    "certificate_body": "证明正文",
     "other": "其他正文",
 }
 
@@ -53,6 +87,7 @@ ROLE_STYLE_IDS = {
     "heading_1": "FormatAgentHeading1",
     "heading_2": "FormatAgentHeading2",
     "heading_3": "FormatAgentHeading3",
+    "heading_4": "FormatAgentHeading4",
     "body": "FormatAgentBody",
     "signature": "FormatAgentSignature",
     "date": "FormatAgentDate",
@@ -68,6 +103,39 @@ ROLE_STYLE_IDS = {
     "bibliography_entry": "FormatAgentBibliographyEntry",
     "equation": "FormatAgentEquation",
     "appendix_heading": "FormatAgentAppendixHeading",
+    "list_of_figures_heading": "FormatAgentListOfFiguresHeading",
+    "list_of_tables_heading": "FormatAgentListOfTablesHeading",
+    "block_quote": "FormatAgentBlockQuote",
+    "code_block": "FormatAgentCodeBlock",
+    "byline": "FormatAgentByline",
+    "affiliation": "FormatAgentAffiliation",
+    "author_note": "FormatAgentAuthorNote",
+    "correspondence": "FormatAgentCorrespondence",
+    "salutation": "FormatAgentSalutation",
+    "complimentary_close": "FormatAgentComplimentaryClose",
+    "cc": "FormatAgentCc",
+    "enclosure": "FormatAgentEnclosure",
+    "legal_definition": "FormatAgentLegalDefinition",
+    "signature_block": "FormatAgentSignatureBlock",
+    "table_of_authorities_heading": "FormatAgentTableOfAuthoritiesHeading",
+    "recipient": "FormatAgentRecipient",
+    "closing": "FormatAgentClosing",
+    "document_number": "FormatAgentDocumentNumber",
+    "copy_to": "FormatAgentCopyTo",
+    "warning_box": "FormatAgentWarningBox",
+    "caution_box": "FormatAgentCautionBox",
+    "note_box": "FormatAgentNoteBox",
+    "tip_box": "FormatAgentTipBox",
+    "procedure_step": "FormatAgentProcedureStep",
+    "command": "FormatAgentCommand",
+    "court_caption": "FormatAgentCourtCaption",
+    "case_number": "FormatAgentCaseNumber",
+    "brief_title": "FormatAgentBriefTitle",
+    "table_of_contents_heading": "FormatAgentTableOfContentsHeading",
+    "authority_entry": "FormatAgentAuthorityEntry",
+    "counsel_block": "FormatAgentCounselBlock",
+    "certificate_heading": "FormatAgentCertificateHeading",
+    "certificate_body": "FormatAgentCertificateBody",
     "other": "FormatAgentOther",
 }
 
@@ -78,9 +146,16 @@ DEFAULT_OUTLINE_LEVELS = {
     "heading_1": 0,
     "heading_2": 1,
     "heading_3": 2,
+    "heading_4": 3,
     "chapter_heading": 0,
     "bibliography_heading": 0,
     "appendix_heading": 0,
+    "list_of_figures_heading": 0,
+    "list_of_tables_heading": 0,
+    "table_of_authorities_heading": 0,
+    "table_of_contents_heading": 0,
+    "brief_title": 0,
+    "certificate_heading": 0,
 }
 
 _ALIGNMENT = {
@@ -207,31 +282,58 @@ def _reset_style_format(style):
             style.element.remove(el)
 
 
-def _get_or_add(parent, tag):
+def _get_or_add_ordered(parent, tag, *successors):
+    """Add an OOXML property without violating the schema child order.
+
+    Word is tolerant of many producer quirks, but an out-of-order ``rPr`` or
+    ``pPr`` can make it repair (and occasionally discard) a generated style.
+    ``python-docx`` exposes ordered descriptors for most, but not all, of the
+    complex-script properties we need.
+    """
     el = parent.find(qn(tag))
     if el is None:
         el = OxmlElement(tag)
-        parent.append(el)
+        parent.insert_element_before(el, *successors)
     return el
 
 
 def _set_style_font(style, rule, cleanup_mode="controlled"):
     rpr = style.element.get_or_add_rPr()
-    rfonts = _get_or_add(rpr, "w:rFonts")
+    rfonts = rpr.get_or_add_rFonts()
     eastasia = rule.get("font_eastasia")
     ascii_font = rule.get("font_ascii") or eastasia
+    complex_font = rule.get("font_cs") or ascii_font
     if eastasia:
         rfonts.set(qn("w:eastAsia"), eastasia)
     if ascii_font:
         rfonts.set(qn("w:ascii"), ascii_font)
         rfonts.set(qn("w:hAnsi"), ascii_font)
-        rfonts.set(qn("w:cs"), ascii_font)
+    if complex_font:
+        rfonts.set(qn("w:cs"), complex_font)
+
+    if rule.get("language"):
+        language = _get_or_add_ordered(
+            rpr, "w:lang", "w:eastAsianLayout", "w:specVanish", "w:oMath")
+        language.set(qn("w:val"), rule["language"])
+        if rule.get("rtl") or rule.get("bidi"):
+            language.set(qn("w:bidi"), rule["language"])
+    for field, getter in (
+        ("caps", rpr.get_or_add_caps),
+        ("small_caps", rpr.get_or_add_smallCaps),
+        ("rtl", rpr.get_or_add_rtl),
+    ):
+        if rule.get(field) is not None:
+            element = getter()
+            element.set(qn("w:val"), "1" if rule[field] else "0")
 
     size_pt = rule.get("size_pt")
     if size_pt is not None:
         style.font.size = Pt(float(size_pt))
         # style.font.size 只保证 w:sz；复杂文字字号 w:szCs 也显式写入。
-        sz_cs = _get_or_add(rpr, "w:szCs")
+        sz_cs = _get_or_add_ordered(
+            rpr, "w:szCs", "w:highlight", "w:u", "w:effect", "w:bdr",
+            "w:shd", "w:fitText", "w:vertAlign", "w:rtl", "w:cs", "w:em",
+            "w:lang", "w:eastAsianLayout", "w:specVanish", "w:oMath")
         sz_cs.set(qn("w:val"), str(int(round(float(size_pt) * 2))))
     if rule.get("bold") is not None:
         style.font.bold = bool(rule["bold"])
@@ -255,16 +357,10 @@ def _set_style_font(style, rule, cleanup_mode="controlled"):
     elif cleanup_mode == "strict":
         style.font.color.rgb = RGBColor(0, 0, 0)
     if rule.get("highlight") is not None:
-        highlight = rpr.find(qn("w:highlight"))
-        if highlight is None:
-            highlight = OxmlElement("w:highlight")
-            # CT_RPr 要求 highlight 位于 underline 之前；直接 append 会使
-            # Word 进入“发现不可读内容”的修复模式并删除整批自定义样式。
-            underline = rpr.find(qn("w:u"))
-            if underline is not None:
-                rpr.insert(list(rpr).index(underline), highlight)
-            else:
-                rpr.append(highlight)
+        highlight = _get_or_add_ordered(
+            rpr, "w:highlight", "w:u", "w:effect", "w:bdr", "w:shd",
+            "w:fitText", "w:vertAlign", "w:rtl", "w:cs", "w:em", "w:lang",
+            "w:eastAsianLayout", "w:specVanish", "w:oMath")
         highlight.set(qn("w:val"), str(rule["highlight"]))
 
 
@@ -273,6 +369,47 @@ def _set_style_paragraph_format(style, rule, outline_level):
     alignment = rule.get("alignment")
     if alignment in _ALIGNMENT:
         pf.alignment = _ALIGNMENT[alignment]
+    ppr = style.element.get_or_add_pPr()
+    border_rule = rule.get("paragraph_border")
+    if isinstance(border_rule, dict):
+        p_borders = _get_or_add_ordered(
+            ppr, "w:pBdr", "w:shd", "w:tabs", "w:suppressAutoHyphens",
+            "w:kinsoku", "w:wordWrap", "w:overflowPunct", "w:topLinePunct",
+            "w:autoSpaceDE", "w:autoSpaceDN", "w:bidi", "w:adjustRightInd",
+            "w:snapToGrid", "w:spacing", "w:ind", "w:contextualSpacing",
+            "w:mirrorIndents", "w:suppressOverlap", "w:jc")
+        for child in list(p_borders):
+            p_borders.remove(child)
+        sides = border_rule.get("sides") or ["top", "bottom", "left", "right"]
+        for side in sides:
+            element = OxmlElement(f"w:{side}")
+            element.set(qn("w:val"), str(border_rule.get("style", "single")))
+            element.set(qn("w:sz"), str(int(round(float(
+                border_rule.get("size_pt", 0.5)) * 8))))
+            element.set(qn("w:space"), str(int(round(float(
+                border_rule.get("space_pt", 1))))))
+            element.set(qn("w:color"), str(
+                border_rule.get("color", "000000")).upper())
+            p_borders.append(element)
+    shading = rule.get("shading")
+    if shading:
+        element = _get_or_add_ordered(
+            ppr, "w:shd", "w:tabs", "w:suppressAutoHyphens", "w:kinsoku",
+            "w:wordWrap", "w:overflowPunct", "w:topLinePunct", "w:autoSpaceDE",
+            "w:autoSpaceDN", "w:bidi", "w:adjustRightInd", "w:snapToGrid",
+            "w:spacing", "w:ind", "w:contextualSpacing", "w:mirrorIndents",
+            "w:suppressOverlap", "w:jc")
+        element.set(qn("w:val"), "clear")
+        element.set(qn("w:color"), "auto")
+        element.set(qn("w:fill"), str(shading).upper())
+    if rule.get("bidi") is not None:
+        bidi = _get_or_add_ordered(
+            ppr, "w:bidi", "w:adjustRightInd", "w:snapToGrid", "w:spacing",
+            "w:ind", "w:contextualSpacing", "w:mirrorIndents",
+            "w:suppressOverlap", "w:jc", "w:textDirection", "w:textAlignment",
+            "w:textboxTightWrap", "w:outlineLvl", "w:divId", "w:cnfStyle",
+            "w:rPr", "w:sectPr", "w:pPrChange")
+        bidi.set(qn("w:val"), "1" if rule["bidi"] else "0")
 
     line_spacing = rule.get("line_spacing")
     if isinstance(line_spacing, dict) and line_spacing.get("pt") is not None:
@@ -392,7 +529,7 @@ _STRICT_RPR_TAGS = {
         "w:u", "w:color", "w:highlight", "w:strike", "w:dstrike",
         "w:caps", "w:smallCaps", "w:vanish", "w:outline", "w:shadow",
         "w:emboss", "w:imprint", "w:position", "w:spacing", "w:w",
-        "w:kern", "w:shd",
+        "w:kern", "w:shd", "w:lang", "w:rtl",
     )
 }
 
@@ -401,7 +538,7 @@ def _clear_run_overrides(
     paragraph, rule, clear_character_style=False, cleanup_mode="controlled",
 ):
     controlled = set()
-    if rule.get("font_eastasia") or rule.get("font_ascii"):
+    if rule.get("font_eastasia") or rule.get("font_ascii") or rule.get("font_cs"):
         controlled.add(qn("w:rFonts"))
     if rule.get("size_pt") is not None:
         controlled.update((qn("w:sz"), qn("w:szCs")))
@@ -413,18 +550,24 @@ def _clear_run_overrides(
         ("color", ("w:color",)),
         ("highlight", ("w:highlight",)),
         ("strike", ("w:strike", "w:dstrike")),
+        ("caps", ("w:caps",)),
+        ("small_caps", ("w:smallCaps",)),
+        ("rtl", ("w:rtl",)),
+        ("language", ("w:lang",)),
     ):
         if rule.get(field) is not None:
             controlled.update(qn(tag) for tag in tags)
     if cleanup_mode == "strict":
         controlled.update(_STRICT_RPR_TAGS)
     elif cleanup_mode == "preserve_emphasis":
-        # 保留作者刻意使用的粗体/斜体，其余异常直刷格式仍清理。
+        # 保留作者刻意使用的粗斜体、小型大写、复杂文字方向和语言标记。
         controlled.difference_update(
-            {qn("w:b"), qn("w:bCs"), qn("w:i"), qn("w:iCs")})
+            {qn("w:b"), qn("w:bCs"), qn("w:i"), qn("w:iCs"),
+             qn("w:caps"), qn("w:smallCaps"), qn("w:rtl"), qn("w:lang")})
         controlled.update(
             tag for tag in _STRICT_RPR_TAGS
-            if tag not in {qn("w:b"), qn("w:bCs"), qn("w:i"), qn("w:iCs")}
+            if tag not in {qn("w:b"), qn("w:bCs"), qn("w:i"), qn("w:iCs"),
+                           qn("w:caps"), qn("w:smallCaps"), qn("w:rtl"), qn("w:lang")}
         )
     linked_style_ids = set()
     if clear_character_style:
@@ -460,6 +603,10 @@ def _clear_paragraph_overrides(
 ):
     ppr = paragraph._p.get_or_add_pPr()
     strict = cleanup_mode == "strict"
+    if strict or rule.get("bidi") is not None:
+        bidi = ppr.find(qn("w:bidi"))
+        if bidi is not None:
+            ppr.remove(bidi)
     if strict or rule.get("alignment") in _ALIGNMENT:
         jc = ppr.find(qn("w:jc"))
         if jc is not None:
@@ -510,6 +657,12 @@ def _clear_paragraph_overrides(
             element = ppr.find(qn(tag))
             if element is not None:
                 ppr.remove(element)
+    else:
+        for field, tag in (("shading", "w:shd"), ("paragraph_border", "w:pBdr")):
+            if rule.get(field) is not None:
+                element = ppr.find(qn(tag))
+                if element is not None:
+                    ppr.remove(element)
 
     # 大纲层级由命名样式提供，段落本身不再直刷 outlineLvl。
     outline = ppr.find(qn("w:outlineLvl"))
@@ -641,9 +794,10 @@ def apply_named_style(
 ):
     """绑定命名样式并清除会遮蔽该样式的直接格式，返回受控字段列表。"""
     clear_character_style = role in {
-        "title", "subtitle", "heading_1", "heading_2", "heading_3",
+        "title", "subtitle", "heading_1", "heading_2", "heading_3", "heading_4",
         "abstract_heading", "chapter_heading", "bibliography_heading",
-        "appendix_heading",
+        "appendix_heading", "brief_title", "certificate_heading",
+        "table_of_contents_heading", "table_of_authorities_heading",
     }
     _clear_run_overrides(
         paragraph, rule, clear_character_style=clear_character_style,
@@ -653,9 +807,10 @@ def apply_named_style(
     has_numbering = isinstance(rule.get("numbering"), dict)
     stripped_prefix = _strip_manual_number_prefix(paragraph, role) if has_numbering else False
     remove_numbering = has_numbering or role in {
-        "title", "subtitle", "heading_1", "heading_2", "heading_3",
+        "title", "subtitle", "heading_1", "heading_2", "heading_3", "heading_4",
         "abstract_heading", "chapter_heading", "bibliography_heading",
-        "appendix_heading",
+        "appendix_heading", "brief_title", "certificate_heading",
+        "table_of_contents_heading", "table_of_authorities_heading",
     }
     _clear_paragraph_overrides(
         paragraph, rule, remove_numbering=remove_numbering,
@@ -675,12 +830,14 @@ def apply_named_style(
         fields.append("invalid_numbering_removed")
     fields.extend(
         field for field in (
-            "font_eastasia", "font_ascii", "size_pt", "bold", "alignment",
+            "font_eastasia", "font_ascii", "font_cs", "language", "size_pt",
+            "bold", "alignment", "caps", "small_caps", "rtl", "bidi",
             "italic", "underline", "color", "highlight", "strike",
             "line_spacing", "space_before_pt", "space_after_pt",
             "first_line_indent_chars", "left_indent_chars", "hanging_indent_chars",
             "keep_with_next", "keep_together", "page_break_before",
             "widow_control", "outline_level",
+            "shading", "paragraph_border",
         )
         if rule.get(field) is not None
     )

@@ -9,9 +9,14 @@
 
 import difflib
 import re
+import zipfile
 from collections import Counter
+from xml.etree import ElementTree as ET
 
 from docx import Document
+
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+NS = {"w": W_NS}
 
 
 def _norm(text):
@@ -20,18 +25,83 @@ def _norm(text):
 
 
 def paragraph_texts(docx_path):
-    """提取文档全部段落（含表格内）的规范化文字，跳过空段。"""
+    """按正文真实顺序提取全部段落，递归包含嵌套表格。"""
+    from core.extract import iter_main_paragraphs
+
     doc = Document(docx_path)
-    texts = [_norm(p.text) for p in doc.paragraphs]
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                texts.extend(_norm(p.text) for p in cell.paragraphs)
+    texts = [_norm(paragraph.text) for paragraph, _ in iter_main_paragraphs(doc)]
     return [t for t in texts if t]
 
 
+def protected_story_texts(docx_path):
+    """读取正文角色排版器之外的 Story 与内容控件文字。"""
+    result = {
+        "headers": [], "footers": [],
+        "footnotes": [], "endnotes": [], "comments": [],
+        "textboxes": [], "content_controls": [],
+    }
+    with zipfile.ZipFile(docx_path) as archive:
+        names = set(archive.namelist())
+        for part_name, kind, item_tag in (
+            ("word/footnotes.xml", "footnotes", "footnote"),
+            ("word/endnotes.xml", "endnotes", "endnote"),
+        ):
+            if part_name not in names:
+                continue
+            root = ET.fromstring(archive.read(part_name))
+            for item in root.findall(f"w:{item_tag}", NS):
+                item_type = item.get(f"{{{W_NS}}}type")
+                try:
+                    item_id = int(item.get(f"{{{W_NS}}}id", "1"))
+                except ValueError:
+                    item_id = 1
+                if item_type in {"separator", "continuationSeparator"} or item_id <= 0:
+                    continue
+                for paragraph in item.findall(".//w:p", NS):
+                    text = _norm("".join(
+                        node.text or "" for node in paragraph.findall(".//w:t", NS)))
+                    if text:
+                        result[kind].append(text)
+        if "word/comments.xml" in names:
+            root = ET.fromstring(archive.read("word/comments.xml"))
+            for paragraph in root.findall(".//w:p", NS):
+                text = _norm("".join(
+                    node.text or "" for node in paragraph.findall(".//w:t", NS)))
+                if text:
+                    result["comments"].append(text)
+        for name in names:
+            if not (
+                name == "word/document.xml"
+                or name.startswith("word/header")
+                or name.startswith("word/footer")
+            ):
+                continue
+            root = ET.fromstring(archive.read(name))
+            if name.startswith("word/header") or name.startswith("word/footer"):
+                kind = "headers" if name.startswith("word/header") else "footers"
+                for paragraph in root.findall(".//w:p", NS):
+                    text = _norm("".join(
+                        node.text or "" for node in paragraph.findall(".//w:t", NS)))
+                    if text:
+                        result[kind].append(text)
+            for textbox in root.findall(".//w:txbxContent", NS):
+                for paragraph in textbox.findall(".//w:p", NS):
+                    text = _norm("".join(
+                        node.text or "" for node in paragraph.findall(".//w:t", NS)))
+                    if text:
+                        result["textboxes"].append(text)
+            for control in root.findall(".//w:sdt", NS):
+                for paragraph in control.findall(".//w:p", NS):
+                    text = _norm("".join(
+                        node.text or "" for node in paragraph.findall(".//w:t", NS)))
+                    if text:
+                        result["content_controls"].append(text)
+    return result
+
+
 def check_text_integrity(source_path, out_path,
-                         allowed_additions=(), expected_stripped_prefixes=()):
+                         allowed_additions=(), expected_stripped_prefixes=(),
+                         allowed_story_changes=()):
     """比对原稿与终稿的段落文字。
     allowed_additions: 允许出现的新增段落文字（如目录标题与占位提示）。
     expected_stripped_prefixes: 允许被剥掉的手工编号前缀（如 ["1.", "2."]）。
@@ -39,6 +109,8 @@ def check_text_integrity(source_path, out_path,
     """
     src = paragraph_texts(source_path)
     out = paragraph_texts(out_path)
+    source_stories = protected_story_texts(source_path)
+    output_stories = protected_story_texts(out_path)
 
     # 剥掉合法新增段
     # Counter 而不是 set：封面多个元数据字段可能合法地使用同一占位值。
@@ -76,8 +148,18 @@ def check_text_integrity(source_path, out_path,
         if tag == "replace" and (i2 - i1) == (j2 - j1):
             changed = [{"from": a, "to": b} for a, b in zip(src[i1:i2], out_filtered[j1:j2])]
 
-    ok = not added and not removed
-    return {"ok": ok, "added": added, "removed": removed, "changed": changed}
+    allowed_story_changes = set(allowed_story_changes)
+    story_differences = [
+        {"story": kind, "source": source_stories[kind], "output": output_stories[kind]}
+        for kind in source_stories
+        if kind not in allowed_story_changes
+        and source_stories[kind] != output_stories[kind]
+    ]
+    ok = not added and not removed and not story_differences
+    return {
+        "ok": ok, "added": added, "removed": removed, "changed": changed,
+        "story_differences": story_differences,
+    }
 
 
 if __name__ == "__main__":
