@@ -7,6 +7,7 @@
 # 本脚本在 "python" 下纯 python-docx + win32com, 只依赖 docx + comtypes/pywin32。
 
 import os
+import json
 import re
 import shutil
 import subprocess
@@ -278,23 +279,67 @@ def validate_rendered_pages(docx_path, pages):
 
 
 def docx_to_pdf_word_com(docx_path, pdf_path):
-    """用 Word COM 导出 PDF。这是 Windows 上最可靠的路径。"""
-    import win32com.client
-    # DispatchEx 强制启动新的 Word 实例——绝不附着到用户正在用的 Word,
-    # 否则 finally 里的 Quit() 会把用户自己打开的文档一起关掉。
-    word = win32com.client.DispatchEx("Word.Application")
-    word.Visible = False
-    word.DisplayAlerts = False
+    """在有超时边界的独立进程中用 Microsoft Word 导出 PDF。"""
+    return _docx_to_pdf_com_candidate(
+        docx_path, pdf_path, "Word.Application", "Microsoft Word")
+
+
+def _docx_to_pdf_com_candidate(docx_path, pdf_path, prog_id, display_name):
+    from core.input_conversion import (
+        _com_timeout_seconds,
+        _office_pids,
+        _office_process_names,
+        _terminate_new_office_processes,
+    )
+
+    source = Path(docx_path).expanduser().resolve()
+    destination = Path(pdf_path).expanduser().resolve()
+    process_names = _office_process_names(prog_id)
+    before = _office_pids(process_names)
+    worker = Path(__file__).with_name("com_pdf_worker.py")
+    command = [
+        sys.executable, str(worker), str(source), str(destination),
+        prog_id, display_name,
+    ]
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    timeout = _com_timeout_seconds()
     try:
-        doc = word.Documents.Open(
-            os.path.abspath(docx_path), ReadOnly=True, ConfirmConversions=False
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=timeout,
+            check=False, creationflags=creationflags,
         )
-        # 导出为 PDF (wdFormatPDF = 17)
-        doc.SaveAs2(os.path.abspath(pdf_path), FileFormat=17)
-        doc.Close()
-    finally:
-        word.Quit()
-    return pdf_path
+    except subprocess.TimeoutExpired as exc:
+        terminated = _terminate_new_office_processes(process_names, before)
+        cleanup = f"；已终止新建 Office 进程 {terminated}" if terminated else ""
+        raise RuntimeError(
+            f"{display_name} PDF 渲染在 {timeout:g} 秒后超时{cleanup}") from exc
+    output = (result.stdout or "").strip().splitlines()
+    try:
+        payload = json.loads(output[-1]) if output else {}
+    except json.JSONDecodeError:
+        payload = {}
+    if result.returncode or not payload.get("ok"):
+        detail = payload.get("error") or (result.stderr or result.stdout or "无诊断输出").strip()
+        raise RuntimeError(f"{display_name} PDF 渲染失败：{detail}")
+    if not destination.is_file() or destination.read_bytes()[:5] != b"%PDF-":
+        raise RuntimeError(f"{display_name} 没有生成有效 PDF：{destination}")
+    return str(destination)
+
+
+def docx_to_pdf_office_com(docx_path, pdf_path):
+    """Microsoft Word 无响应或不可用时继续回退到 WPS。"""
+    errors = []
+    for prog_id, display_name in (
+        ("Word.Application", "Microsoft Word"),
+        ("Kwps.Application", "WPS"),
+        ("wps.Application", "WPS"),
+    ):
+        try:
+            return _docx_to_pdf_com_candidate(
+                docx_path, pdf_path, prog_id, display_name)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+    raise RuntimeError("；".join(errors))
 
 
 def _soffice_candidates():
@@ -434,10 +479,16 @@ def docx_to_pdf_libreoffice(docx_path, pdf_path):
 def docx_to_pdf(docx_path, pdf_path):
     """按平台选择 DOCX → PDF 渲染器。"""
     if sys.platform == "win32":
+        errors = []
         try:
-            return docx_to_pdf_word_com(docx_path, pdf_path)
-        except (ImportError, ModuleNotFoundError):
+            return docx_to_pdf_office_com(docx_path, pdf_path)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+        try:
             return docx_to_pdf_libreoffice(docx_path, pdf_path)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+        raise RuntimeError("DOCX 渲染失败：" + "；".join(errors))
     return docx_to_pdf_libreoffice(docx_path, pdf_path)
 
 
@@ -445,21 +496,57 @@ def pdf_to_png(pdf_path, png_dir, dpi=150):
     """PDF 转 PNG (逐页)。用 fitz (PyMuPDF) 或 pymupdf。备选: pdfium / pdf2image。
     优先 fitz, 没装则降级为 pymupdf。
     """
+    os.makedirs(png_dir, exist_ok=True)
     try:
         import pymupdf as fitz
     except ImportError:
         try:
             import fitz  # 兼容较旧的 PyMuPDF
         except ImportError:
-            raise RuntimeError("需要安装 PyMuPDF: pip install PyMuPDF")
+            fitz = None
     pages = []
-    pdf = fitz.open(pdf_path)
-    for i, page in enumerate(pdf):
-        pix = page.get_pixmap(dpi=dpi)
+    if fitz is not None:
+        pdf = fitz.open(pdf_path)
+        try:
+            for i, page in enumerate(pdf):
+                pix = page.get_pixmap(dpi=dpi)
+                png_path = os.path.join(png_dir, f"page_{i:02d}.png")
+                pix.save(png_path)
+                pages.append(png_path)
+        finally:
+            pdf.close()
+        return pages
+
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        pdfium = None
+    if pdfium is not None:
+        pdf = pdfium.PdfDocument(pdf_path)
+        try:
+            for i in range(len(pdf)):
+                page = pdf[i]
+                bitmap = page.render(scale=dpi / 72.0)
+                png_path = os.path.join(png_dir, f"page_{i:02d}.png")
+                try:
+                    bitmap.to_pil().save(png_path)
+                finally:
+                    bitmap.close()
+                    page.close()
+                pages.append(png_path)
+        finally:
+            pdf.close()
+        return pages
+
+    try:
+        from pdf2image import convert_from_path
+    except ImportError as exc:
+        raise RuntimeError(
+            "需要安装 PyMuPDF、pypdfium2 或 pdf2image 之一") from exc
+    for i, image in enumerate(convert_from_path(pdf_path, dpi=dpi)):
         png_path = os.path.join(png_dir, f"page_{i:02d}.png")
-        pix.save(png_path)
+        image.save(png_path, "PNG")
         pages.append(png_path)
-    pdf.close()
     return pages
 
 

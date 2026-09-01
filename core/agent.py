@@ -199,16 +199,33 @@ class Agent:
         if rolemap is not None:
             # 外部给定（宿主 Agent 自标）的 RoleMap 也要过校验：角色合法、非表格段全覆盖
             from core.schema import BASE_ROLES
+            if not isinstance(rolemap, dict):
+                raise ValueError("RoleMap 必须是 idx → role 的 JSON object")
+            non_integer_keys = [
+                key for key in rolemap
+                if not isinstance(key, int) or isinstance(key, bool)
+            ]
+            if non_integer_keys:
+                raise ValueError(
+                    f"RoleMap 键必须是整数段落 idx：{non_integer_keys[:10]}")
+            valid_indices = {p["idx"] for p in paragraphs}
             expected = {
                 p["idx"] for p in paragraphs
                 if p.get("editable", True) and not p.get("in_table")
             }
-            bad_roles = {r for r in rolemap.values() if r not in BASE_ROLES}
+            bad_roles = [
+                (key, value) for key, value in rolemap.items()
+                if not isinstance(value, str) or value not in BASE_ROLES
+            ]
             if bad_roles:
-                raise ValueError(f"RoleMap 含非法角色 {sorted(bad_roles)}，合法枚举：{BASE_ROLES}")
+                raise ValueError(
+                    f"RoleMap 含非法角色 {bad_roles[:10]}，合法枚举：{BASE_ROLES}")
             missing = expected - set(rolemap)
             if missing:
                 raise ValueError(f"RoleMap 未覆盖这些非表格段落：{sorted(missing)}")
+            extra = set(rolemap) - valid_indices
+            if extra:
+                raise ValueError(f"RoleMap 含不存在的段落 idx：{sorted(extra)}")
             self._emit("标注角色", "RoleMap 由外部给定（JSON），校验通过，跳过标注", status="ok")
         else:
             self._emit("标注角色", "正在逐段判断角色（标题/正文/落款/日期 ...）")

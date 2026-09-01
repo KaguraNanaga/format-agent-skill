@@ -1,10 +1,15 @@
 """受支持输入格式到临时 DOCX 的显式、可审计转换层。"""
 
 import contextlib
+import ctypes
+import json
 import os
+import signal
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -43,70 +48,145 @@ def _office_candidates(extension):
     return wps + word if extension == ".wps" else word + wps
 
 
+def _com_timeout_seconds():
+    raw = os.environ.get("FORMAT_AGENT_COM_TIMEOUT_SECONDS", "45")
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 45.0
+    return min(300.0, max(5.0, value))
+
+
+def _office_process_names(prog_id):
+    return ("wps.exe",) if prog_id.lower().startswith(("kwps", "wps")) else ("winword.exe",)
+
+
+def _office_pids(process_names):
+    """用 Win32 Toolhelp 枚举 Office 进程；不依赖 tasklist 的权限/语言。"""
+    if os.name != "nt":
+        return set()
+    from ctypes import wintypes
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = (
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = (
+        wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = (
+        wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W))
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+    invalid_handle = ctypes.c_void_p(-1).value
+    if snapshot == invalid_handle:
+        return set()
+    wanted = {name.casefold() for name in process_names}
+    result = set()
+    entry = PROCESSENTRY32W()
+    entry.dwSize = ctypes.sizeof(entry)
+    try:
+        success = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while success:
+            if entry.szExeFile.casefold() in wanted:
+                result.add(int(entry.th32ProcessID))
+            success = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return result
+
+
+def _terminate_new_office_processes(process_names, before):
+    """超时后只结束本次新出现的 Office 进程，不触碰用户原有会话。"""
+    if os.name != "nt":
+        return []
+    terminated = []
+    # COM 激活进程可能在工作进程被终止后才迟到启动；短暂轮询，防止
+    # WINWORD/WPS 成为永久后台孤儿。before 中的用户原有进程永不触碰。
+    for _ in range(10):
+        time.sleep(0.5)
+        new_pids = _office_pids(process_names) - set(before) - set(terminated)
+        for pid in sorted(new_pids):
+            try:
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel32.OpenProcess.argtypes = (
+                    ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+                kernel32.OpenProcess.restype = ctypes.c_void_p
+                kernel32.TerminateProcess.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+                kernel32.TerminateProcess.restype = ctypes.c_int
+                kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+                handle = kernel32.OpenProcess(0x0001, False, pid)
+                if handle:
+                    try:
+                        if kernel32.TerminateProcess(handle, 1):
+                            terminated.append(pid)
+                            continue
+                    finally:
+                        kernel32.CloseHandle(handle)
+                os.kill(pid, signal.SIGTERM)
+                terminated.append(pid)
+            except OSError:
+                pass
+    return terminated
+
+
+def _convert_with_com_candidate(source, destination, prog_id, display_name):
+    process_names = _office_process_names(prog_id)
+    before = _office_pids(process_names)
+    worker = Path(__file__).with_name("com_conversion_worker.py")
+    command = [
+        sys.executable, str(worker), str(source), str(destination),
+        prog_id, display_name,
+    ]
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    timeout = _com_timeout_seconds()
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=timeout,
+            check=False, creationflags=creationflags,
+        )
+    except subprocess.TimeoutExpired as exc:
+        terminated = _terminate_new_office_processes(process_names, before)
+        cleanup = f"；已终止新建 Office 进程 {terminated}" if terminated else ""
+        raise InputConversionError(
+            f"{display_name} COM 转换在 {timeout:g} 秒后超时{cleanup}") from exc
+    output = (result.stdout or "").strip().splitlines()
+    try:
+        payload = json.loads(output[-1]) if output else {}
+    except json.JSONDecodeError:
+        payload = {}
+    if result.returncode or not payload.get("ok"):
+        detail = payload.get("error") or (result.stderr or result.stdout or "无诊断输出").strip()
+        raise InputConversionError(f"{display_name}: {detail}")
+    _validate_docx(destination)
+    return payload.get("converter") or display_name
+
+
 def _convert_with_com(source, destination):
     if os.name != "nt":
         raise InputConversionError("COM 转换只支持 Windows")
-    try:
-        import pythoncom
-        import win32com.client
-    except ModuleNotFoundError as exc:
-        raise InputConversionError(
-            "缺少 pywin32，无法调用 Word/WPS 转换；请安装 pywin32 或 LibreOffice。") from exc
-
     errors = []
-    pythoncom.CoInitialize()
-    try:
-        for prog_id, display_name in _office_candidates(source.suffix.lower()):
-            app = document = None
-            try:
-                try:
-                    app = win32com.client.DispatchEx(prog_id)
-                except Exception:
-                    app = win32com.client.Dispatch(prog_id)
-                try:
-                    app.Visible = False
-                except Exception:
-                    pass
-                try:
-                    app.DisplayAlerts = 0
-                except Exception:
-                    pass
-                try:
-                    # msoAutomationSecurityForceDisable：转换旧格式时禁止自动宏。
-                    app.AutomationSecurity = 3
-                except Exception:
-                    pass
-                try:
-                    document = app.Documents.Open(
-                        str(source), ConfirmConversions=False, ReadOnly=True,
-                        AddToRecentFiles=False, Visible=False,
-                        OpenAndRepair=False, NoEncodingDialog=True,
-                    )
-                except Exception:
-                    # WPS 的 COM 参数表在不同版本间不完全一致；位置参数 2
-                    # 对应 ConfirmConversions，参数 3 对应 ReadOnly。
-                    document = app.Documents.Open(str(source), False, True)
-                try:
-                    document.SaveAs2(str(destination), FileFormat=16)
-                except Exception:
-                    document.SaveAs2(str(destination), 16)
-                _validate_docx(destination)
-                return display_name
-            except Exception as exc:  # 逐一回退到下一套 Office
-                errors.append(f"{display_name}: {exc}")
-            finally:
-                if document is not None:
-                    try:
-                        document.Close(SaveChanges=False)
-                    except Exception:
-                        pass
-                if app is not None:
-                    try:
-                        app.Quit()
-                    except Exception:
-                        pass
-    finally:
-        pythoncom.CoUninitialize()
+    for prog_id, display_name in _office_candidates(source.suffix.lower()):
+        try:
+            return _convert_with_com_candidate(
+                source, destination, prog_id, display_name)
+        except InputConversionError as exc:
+            errors.append(str(exc))
     raise InputConversionError(
         "未能使用 Microsoft Word/WPS 转换输入文件。" + "；".join(errors))
 

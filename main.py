@@ -1,6 +1,6 @@
 # CLI 串全流程（PLAN.md 第 7 节）：
 #   python main.py --spec assets/spec.txt --target assets/messy.docx --out out/formatted.docx
-# 编排逻辑统一在 core/agent.py（与演示界面 app.py 共用，保证两条入口行为一致），
+# 编排逻辑统一在 core/agent.py，供 CLI、GUI 和 Skill 宿主共用，
 # CLI 只是把 Agent 的工作日志事件打印到终端。
 # 降级：--spec-json 直接喂人肉 FormatSpec JSON；--rolemap-json 直接喂人肉 RoleMap。
 
@@ -27,6 +27,15 @@ def main():
         help="使用内置版式基线包；机关/学校/法院/投稿机构模板仍优先")
     ap.add_argument(
         "--running-head", help="MLA 等 Style Pack 的页眉文字（通常为作者姓氏）")
+    ap.add_argument(
+        "--legal-citations-json",
+        help="us-legal-brief 的精确 TA 标记数组 JSON（text/long/short/category）")
+    ap.add_argument(
+        "--insert-toa", action="store_true",
+        help="us-legal-brief：在已有 Table of Authorities 标题后插入 TOA 域")
+    ap.add_argument(
+        "--create-toa-heading", action="store_true",
+        help="us-legal-brief：找不到 TOA 标题时在文末创建标题并插入域")
     ap.add_argument("--rolemap-json", help="直接给 RoleMap JSON（跳过 LLM 角色标注）")
     ap.add_argument(
         "--target", required=True,
@@ -52,6 +61,31 @@ def main():
                          "宿主 Agent 读清单后自行产出 RoleMap/FormatSpec 再回调本程序")
     args = ap.parse_args()
 
+    legal_marks = None
+    if args.legal_citations_json:
+        try:
+            with open(args.legal_citations_json, encoding="utf-8") as handle:
+                legal_marks = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"法律引证标记 JSON 读取失败：{exc}", file=sys.stderr)
+            return 6
+        if not isinstance(legal_marks, list):
+            print("法律引证标记 JSON 顶层必须是 array", file=sys.stderr)
+            return 6
+    legal_options_requested = bool(
+        legal_marks is not None or args.insert_toa or args.create_toa_heading)
+    if legal_options_requested and args.style_pack != "us-legal-brief":
+        ap.error(
+            "--legal-citations-json/--insert-toa/--create-toa-heading "
+            "只能与 --style-pack us-legal-brief 一起使用")
+    style_pack_options = {"running_head": args.running_head}
+    if args.style_pack == "us-legal-brief":
+        style_pack_options.update({
+            "citation_marks": legal_marks or [],
+            "insert_toa": bool(args.insert_toa or args.create_toa_heading),
+            "create_heading": bool(args.create_toa_heading),
+        })
+
     if args.preflight_only:
         from core.preflight import (
             PreflightError, merge_preflight_reports, preflight_docx,
@@ -68,7 +102,7 @@ def main():
             elif args.style_pack:
                 from core.style_packs import get_style_pack
                 preflight_spec = get_style_pack(
-                    args.style_pack, running_head=args.running_head)
+                    args.style_pack, **style_pack_options)
             with ExitStack() as stack:
                 converted_target = stack.enter_context(converted_input(args.target))
                 converted_template = (
@@ -127,30 +161,42 @@ def main():
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
 
-    kwargs = {"target_path": args.target, "out_path": args.out,
-              "verify": args.verify, "refresh_fields": args.refresh_fields,
-              "allow_risky_structure": args.allow_risky_structure}
-    if args.cleanup_mode:
-        kwargs["cleanup_mode"] = args.cleanup_mode
-    if args.report:
-        kwargs["report_path"] = args.report
-    if args.style_pack:
-        kwargs["style_pack"] = args.style_pack
-        kwargs["style_pack_options"] = {"running_head": args.running_head}
-    elif args.spec_json:
-        with open(args.spec_json, encoding="utf-8") as f:
-            kwargs["spec"] = json.load(f)
-    elif args.template:
-        kwargs["template_path"] = args.template
-        if args.template_rolemap_json:
-            with open(args.template_rolemap_json, encoding="utf-8") as f:
-                kwargs["template_rolemap"] = {int(k): v for k, v in json.load(f).items()}
-    else:
-        with open(args.spec, encoding="utf-8") as f:
-            kwargs["spec_text"] = f.read()
-    if args.rolemap_json:
-        with open(args.rolemap_json, encoding="utf-8") as f:
-            kwargs["rolemap"] = {int(k): v for k, v in json.load(f).items()}
+    try:
+        kwargs = {"target_path": args.target, "out_path": args.out,
+                  "verify": args.verify, "refresh_fields": args.refresh_fields,
+                  "allow_risky_structure": args.allow_risky_structure}
+        if args.cleanup_mode:
+            kwargs["cleanup_mode"] = args.cleanup_mode
+        if args.report:
+            kwargs["report_path"] = args.report
+        if args.style_pack:
+            kwargs["style_pack"] = args.style_pack
+            kwargs["style_pack_options"] = style_pack_options
+        elif args.spec_json:
+            with open(args.spec_json, encoding="utf-8") as f:
+                kwargs["spec"] = json.load(f)
+        elif args.template:
+            kwargs["template_path"] = args.template
+            if args.template_rolemap_json:
+                with open(args.template_rolemap_json, encoding="utf-8") as f:
+                    template_rolemap_payload = json.load(f)
+                    if not isinstance(template_rolemap_payload, dict):
+                        raise ValueError("template RoleMap 顶层必须是 object")
+                    kwargs["template_rolemap"] = {
+                        int(k): v for k, v in template_rolemap_payload.items()}
+        else:
+            with open(args.spec, encoding="utf-8") as f:
+                kwargs["spec_text"] = f.read()
+        if args.rolemap_json:
+            with open(args.rolemap_json, encoding="utf-8") as f:
+                rolemap_payload = json.load(f)
+                if not isinstance(rolemap_payload, dict):
+                    raise ValueError("RoleMap 顶层必须是 object")
+                kwargs["rolemap"] = {
+                    int(k): v for k, v in rolemap_payload.items()}
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        print(f"输入配置读取失败：{exc}", file=sys.stderr)
+        return 6
 
     def print_event(e):
         icon = _STATUS_ICON.get(e["status"], " ")
@@ -163,6 +209,7 @@ def main():
     )
     from core.preflight import PreflightBlockedError, PreflightError
     from core.input_conversion import InputConversionError
+    from core.schema import SpecValidationError
     try:
         # CLI 还会写中间 JSON；把它们也纳入碰撞检测，避免自定义 report
         # 路径在成功后又被 metadata 静默覆盖。
@@ -195,6 +242,15 @@ def main():
     except InputConversionError as exc:
         print(f"\n输入转换失败，未执行：{exc}", file=sys.stderr)
         return 5
+    except SpecValidationError as exc:
+        print(f"\nFormatSpec 校验失败，未执行：{exc}", file=sys.stderr)
+        return 6
+    except ValueError as exc:
+        print(f"\n输入契约校验失败，未执行：{exc}", file=sys.stderr)
+        return 6
+    except OSError as exc:
+        print(f"\n文件访问失败，未执行：{exc}", file=sys.stderr)
+        return 7
 
     # 归档中间产物（演示时要展示两个 JSON）
     write_json_atomic(base + "_formatspec.json", result["spec"])
@@ -202,7 +258,9 @@ def main():
         base + "_rolemap.json",
         {str(k): v for k, v in sorted(result["rolemap"].items())})
     write_json_atomic(base + "_stylemap.json", result["stylemap"])
-    write_json_atomic(base + "_preflight.json", result["preflight"])
+    preflight_output = dict(result["preflight"])
+    preflight_output["input_conversion"] = result.get("input_conversion")
+    write_json_atomic(base + "_preflight.json", preflight_output)
     if result["issues"]:
         write_json_atomic(base + "_issues.json", result["issues"])
 

@@ -28,6 +28,27 @@ python main.py --style-pack official-cn-gbt9704 \
 
 `us-legal-brief` 默认只保留并盘点现有 TA/TOA。新增域必须显式提供配置：
 
+CLI 使用独立的引证标记数组：
+
+```json
+[
+  {
+    "text": "Example v. Sample",
+    "long": "Example v. Sample, 123 F.3d 456 (2024)",
+    "short": "Example",
+    "category": 1
+  }
+]
+```
+
+```bash
+python main.py --style-pack us-legal-brief \
+  --legal-citations-json citation-marks.json --insert-toa \
+  --target brief.docx --out output/brief.docx
+```
+
+若文稿没有 TOA 标题，只有用户明确要求时才把 `--insert-toa` 改为 `--create-toa-heading`。FormatSpec API 也支持下列 `legal` 对象：
+
 ```json
 {
   "profile": "english_legal_brief",
@@ -59,7 +80,7 @@ python main.py --style-pack official-cn-gbt9704 \
 - `insert_toa=true` 默认要求文档已经有被识别的 `table_of_authorities_heading`。
 - `create_heading=true` 才允许在文末新增 `TABLE OF AUTHORITIES`；该文字进入完整性白名单与修改日志。
 - 再次运行不会重复插入相同段落中的 TA 或已有 TOA 域。
-- Word 打开时会请求更新域；Windows 可用 `--refresh-fields` 立即刷新。
+- Word 打开时会请求更新域；Windows 可用 `--refresh-fields` 刷新本地安全域。`INCLUDETEXT/LINK/DDE/RD` 和未知外部域会被跳过。
 
 本模块不验证 Bluebook、引证真实性、法院管辖规则、封面颜色、字数限制或电子提交要求；也不生成行号。具体法院的 local rules 永远优先。
 
@@ -71,9 +92,11 @@ python main.py --style-pack official-cn-gbt9704 \
 |---|---|---|
 | `.doc` | Microsoft Word → WPS | Windows + pywin32，并安装至少一个应用 |
 | `.wps` | WPS → Microsoft Word | Windows + pywin32；WPS 优先 |
-| `.odt` / `.rtf` | LibreOffice → Word/WPS | 推荐安装 LibreOffice；Windows 可回退 COM |
+| `.odt` / `.rtf` | LibreOffice → Word/WPS | 推荐安装 LibreOffice；RTF 的 COM 兼容较广，ODT 是否可回退取决于本机 Office 导入筛选器 |
 | `.pdf` | 拒绝 | PDF/OCR 版面还原不是安全的 Word 格式迁移 |
 
 转换文件位于临时目录；系统把转换后的 DOCX 当成新输入，重新执行全部 Story 预检和文本完整性校验，结束后清理临时文件。`input_conversion` 会记录源路径、转换器、有损标记和警告。
+
+Word/WPS COM 转换会禁用自动宏和打开时链接更新；仍只应处理用户授权的本地文件。每个 Office 候选在独立工作进程中运行，默认 45 秒超时后只清理本次新启动的 Office 进程并回退下一候选，不结束运行前已有的 Office 会话。可用 `FORMAT_AGENT_COM_TIMEOUT_SECONDS` 在 5~300 秒间调整。LibreOffice 使用独立临时转换目录。
 
 常见损失包括分页变化、缺失字体替代、浮动对象锚点变化、域降级及 WPS/Word 私有功能丢失。即使校验通过，交付前仍应视觉核对关键页面。

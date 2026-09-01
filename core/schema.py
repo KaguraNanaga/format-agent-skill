@@ -527,6 +527,7 @@ def validate_spec(spec):
                 if not isinstance(marks, list):
                     errors.append("legal.citation_marks 必须是 array")
                 else:
+                    seen_mark_texts = set()
                     for index, mark in enumerate(marks):
                         path = f"legal.citation_marks[{index}]"
                         if not isinstance(mark, dict):
@@ -536,6 +537,12 @@ def validate_spec(spec):
                             value = mark.get(field)
                             if not isinstance(value, str) or not value.strip():
                                 errors.append(f"{path}.{field} 必须是非空字符串")
+                        text_value = mark.get("text")
+                        if isinstance(text_value, str) and text_value.strip():
+                            normalized_text = text_value.strip()
+                            if normalized_text in seen_mark_texts:
+                                errors.append(f"{path}.text 不得与前面的标记重复")
+                            seen_mark_texts.add(normalized_text)
                         short = mark.get("short")
                         if short is not None and (
                             not isinstance(short, str) or not short.strip()
@@ -545,6 +552,9 @@ def validate_spec(spec):
                         if not isinstance(category, int) or isinstance(category, bool) \
                                 or not 1 <= category <= 16:
                             errors.append(f"{path}.category 必须是 1~16 的整数")
+                        bold = mark.get("bold")
+                        if bold is not None and not isinstance(bold, bool):
+                            errors.append(f"{path}.bold 必须是 boolean")
 
     if isinstance(table, dict) and table.get("landscape_table_indices"):
         if isinstance(page, dict) and isinstance(page.get("columns"), int) \

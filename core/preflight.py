@@ -16,6 +16,7 @@ W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 M_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 WP_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+PR_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 NS = {"w": W_NS, "r": R_NS, "m": M_NS, "wp": WP_NS}
 
 _FIELD_KINDS = (
@@ -26,6 +27,11 @@ _FIELD_PATTERN = re.compile(
     r"\b(" + "|".join(_FIELD_KINDS) + r")\b(?:\s+([^\s\\]+))?",
     re.I,
 )
+_FIELD_KIND_PATTERN = re.compile(r"\s*([A-Za-z][A-Za-z0-9]*)")
+_UNSAFE_FIELD_KINDS = {
+    "DDE", "DDEAUTO", "LINK", "INCLUDETEXT", "INCLUDEPICTURE",
+    "DATABASE", "RD",
+}
 
 
 class PreflightError(RuntimeError):
@@ -56,6 +62,10 @@ def _part_kind(name):
 
 def _count(root, path):
     return len(root.findall(path, NS))
+
+
+def _onoff_true(value):
+    return str(value or "0").strip().lower() in {"1", "true", "on"}
 
 
 def _nested_table_count(root):
@@ -132,8 +142,12 @@ def _field_data(root):
         if (element.get(f"{{{W_NS}}}instr") or "").strip()
     )
     field_types = Counter()
+    all_field_types = Counter()
     cross_reference_targets = []
     for instruction in instructions:
+        first = _FIELD_KIND_PATTERN.match(instruction)
+        if first:
+            all_field_types[first.group(1).upper()] += 1
         for match in _FIELD_PATTERN.finditer(instruction):
             kind = match.group(1).upper()
             field_types[kind] += 1
@@ -147,6 +161,7 @@ def _field_data(root):
     return {
         "instructions": instructions,
         "field_types": dict(sorted(field_types.items())),
+        "all_field_types": dict(sorted(all_field_types.items())),
         "cross_reference_targets": cross_reference_targets,
         "bookmarks": sorted(bookmarks),
     }
@@ -194,6 +209,7 @@ def _story_stats(name, root):
         "math_objects": _count(root, ".//m:oMath"),
         "fields": len(field_data["instructions"]),
         "field_types": field_data["field_types"],
+        "all_field_types": field_data["all_field_types"],
         "field_instructions": field_data["instructions"],
         "cross_reference_targets": field_data["cross_reference_targets"],
         "bookmarks": field_data["bookmarks"],
@@ -241,6 +257,22 @@ def scan_docx(docx_path):
             settings = None
             if "word/settings.xml" in names:
                 settings = ET.fromstring(archive.read("word/settings.xml"))
+            external_relationship_types = Counter()
+            for name in sorted(
+                item for item in names if item.endswith(".rels")
+            ):
+                try:
+                    relationships = ET.fromstring(archive.read(name))
+                except ET.ParseError as exc:
+                    raise PreflightError(
+                        f"OOXML 关系部件无法解析：{name}: {exc}") from exc
+                for relationship in relationships.findall(
+                    f"{{{PR_NS}}}Relationship"
+                ):
+                    if (relationship.get("TargetMode") or "").lower() != "external":
+                        continue
+                    rel_type = (relationship.get("Type") or "unknown").rsplit("/", 1)[-1]
+                    external_relationship_types[rel_type] += 1
             scan = {
                 "path": path,
                 "file_size": os.path.getsize(path),
@@ -253,12 +285,21 @@ def scan_docx(docx_path):
                     1 for name in names if name.startswith("word/embeddings/")),
                 "media_files": sum(
                     1 for name in names if name.startswith("word/media/")),
+                "external_relationship_count": sum(
+                    external_relationship_types.values()),
+                "external_relationship_types": dict(
+                    sorted(external_relationship_types.items())),
                 "has_macros": "word/vbaProject.bin" in names,
                 "has_digital_signatures": any(
                     name.startswith("_xmlsignatures/") for name in names),
+                # WPS 会在未保护文档中写入 enforcement="0" 的占位元素；
+                # 仅元素存在并不代表编辑保护已启用。
                 "has_document_protection": bool(
                     settings is not None
-                    and settings.find("w:documentProtection", NS) is not None),
+                    and (protection := settings.find(
+                        "w:documentProtection", NS)) is not None
+                    and _onoff_true(protection.get(
+                        f"{{{W_NS}}}enforcement"))),
             }
     except zipfile.BadZipFile as exc:
         raise PreflightError("文件不是有效的 DOCX/ZIP 包") from exc
@@ -277,14 +318,21 @@ def scan_docx(docx_path):
         }
         scan["story_counts"][kind]["parts"] = len(items)
     field_inventory = Counter()
+    all_field_inventory = Counter()
     bookmarks = set()
     cross_reference_targets = []
     for story in scan["story_parts"]:
         field_inventory.update(story.get("field_types") or {})
+        all_field_inventory.update(story.get("all_field_types") or {})
         bookmarks.update(story.get("bookmarks") or [])
         cross_reference_targets.extend(
             story.get("cross_reference_targets") or [])
     scan["field_inventory"] = dict(sorted(field_inventory.items()))
+    scan["all_field_inventory"] = dict(sorted(all_field_inventory.items()))
+    scan["unsafe_field_inventory"] = {
+        kind: count for kind, count in sorted(all_field_inventory.items())
+        if kind in _UNSAFE_FIELD_KINDS
+    }
     scan["bookmark_names"] = sorted(bookmarks)
     scan["cross_reference_targets"] = cross_reference_targets
     scan["broken_cross_references"] = sorted({
@@ -356,6 +404,17 @@ def assess_preflight(
             "FIELD_REFRESH_REQUIRED", "warning",
             "检测到 Word 域；保留域代码并校验交叉引用目标，域结果需在 Word 中刷新",
             totals["fields"], "refresh_fields"))
+    if scan.get("unsafe_field_inventory"):
+        kinds = ", ".join(sorted(scan["unsafe_field_inventory"]))
+        risks.append(_risk(
+            "UNSAFE_EXTERNAL_FIELDS", "warning",
+            f"检测到可能访问外部资源的域（{kinds}）；自动域刷新将跳过这些域",
+            sum(scan["unsafe_field_inventory"].values()), "skip_refresh"))
+    if scan.get("external_relationship_count"):
+        risks.append(_risk(
+            "EXTERNAL_RELATIONSHIPS", "warning",
+            "检测到外部超链接或外部资源关系；排版器只保留关系，不主动访问目标",
+            scan["external_relationship_count"], "preserve_only"))
     if scan.get("broken_cross_references"):
         risks.append(_risk(
             "BROKEN_CROSS_REFERENCES", "warning",
