@@ -8,7 +8,7 @@ import re
 from docx import Document
 from docx.oxml.ns import qn
 
-from core.effective_props import get_paragraph_effective_font
+from core.effective_props import effective_props, get_paragraph_effective_font
 
 _ALIGN_MAP = {0: "left", 1: "center", 2: "right", 3: "justify"}
 
@@ -195,6 +195,7 @@ def _spacing_pt(paragraph):
 
 def _para_record(idx, p, in_table):
     eastasia, size_pt, bold = get_paragraph_effective_font(p)
+    character = effective_props(p)
     sb, sa = _spacing_pt(p)
     full_text = p.text.strip()
     manual = manual_number_prefix(full_text)
@@ -212,6 +213,9 @@ def _para_record(idx, p, in_table):
         "ends_with_sentence_punct": full_text.endswith(_SENTENCE_ENDINGS),
         "size_pt": size_pt,
         "bold": bold,
+        "italic": bool(character.get("italic")),
+        "underline": bool(character.get("underline")),
+        "color": character.get("color"),
         "alignment": _alignment_name(p),
         "style_name": p.style.name if p.style is not None else None,
         "outline_level": _outline_level(p),

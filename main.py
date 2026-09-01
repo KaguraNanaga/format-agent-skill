@@ -26,6 +26,12 @@ def main():
     ap.add_argument("--report", help="对照报告路径（默认 <out去掉扩展名>_report.md）")
     ap.add_argument("--verify", action="store_true",
                     help="排版后用同一个多模态模型做一轮视觉验证并定向修复")
+    ap.add_argument(
+        "--refresh-fields", action="store_true",
+        help="Windows 下调用 Microsoft Word 刷新目录、动态页眉和页码并保存")
+    ap.add_argument(
+        "--cleanup-mode", choices=("controlled", "strict", "preserve_emphasis"),
+        help="直接格式清洗策略：受控字段/严格克隆/保留正文粗斜体强调")
     ap.add_argument("--extract-only", action="store_true",
                     help="（Agent 内置智能模式）只抽取段落清单 JSON，不做排版；"
                          "宿主 Agent 读清单后自行产出 RoleMap/FormatSpec 再回调本程序")
@@ -47,7 +53,9 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
 
     kwargs = {"target_path": args.target, "out_path": args.out,
-              "verify": args.verify}
+              "verify": args.verify, "refresh_fields": args.refresh_fields}
+    if args.cleanup_mode:
+        kwargs["cleanup_mode"] = args.cleanup_mode
     if args.report:
         kwargs["report_path"] = args.report
     if args.spec_json:

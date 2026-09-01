@@ -27,6 +27,28 @@ _HEADING_PATTERNS = [
 ]
 _HEADING_MAX_LEN = 40
 
+_THESIS_EXACT_ROLES = {
+    "摘要": "abstract_heading",
+    "摘 要": "abstract_heading",
+    "参考文献": "bibliography_heading",
+    "参考 文献": "bibliography_heading",
+}
+
+
+def detect_document_profile(paragraphs):
+    """用高置信语义信号识别论文；不足时保持 general，避免影响公文流程。"""
+    texts = [str(p.get("text") or "").strip() for p in paragraphs if not p.get("in_table")]
+    signals = 0
+    if any(text in {"摘要", "摘 要"} or re.match(r"^摘要[：:]", text) for text in texts):
+        signals += 1
+    if any(re.match(r"^(关键词|关键字)[：:]", text) for text in texts):
+        signals += 1
+    if any(text.replace(" ", "") == "参考文献" for text in texts):
+        signals += 1
+    if any("学位论文" in text or "毕业论文" in text for text in texts):
+        signals += 2
+    return "thesis" if signals >= 2 else "general"
+
 
 def _heading_role_from_metadata(paragraph):
     if not paragraph:
@@ -92,7 +114,7 @@ def _numbered_body_evidence(paragraph):
     return False
 
 
-def regex_role(text, paragraph=None):
+def regex_role(text, paragraph=None, profile=None):
     """确定性预识别；无把握返回 None（交给 LLM）。
 
     ``paragraph`` 是 extract.py 的元数据记录。对数字前缀，必须使用
@@ -101,6 +123,20 @@ def regex_role(text, paragraph=None):
     t = text.strip()
     if not t:
         return None
+
+    compact = t.replace(" ", "")
+    if t in _THESIS_EXACT_ROLES or compact in _THESIS_EXACT_ROLES:
+        return _THESIS_EXACT_ROLES.get(t, _THESIS_EXACT_ROLES.get(compact))
+    if re.match(r"^摘要[：:]", compact):
+        return "abstract_body"
+    if re.match(r"^(关键词|关键字)[：:]", compact):
+        return "keywords"
+    if re.match(r"^\[\s*\d+\s*\]", t):
+        return "bibliography_entry"
+    if re.match(r"^(附录|Appendix)\s*[A-Z一二三四五六七八九十\d]*", t, re.I):
+        return "appendix_heading"
+    if len(t) <= 80 and "=" in t and not t.endswith(("。", "；", ";")):
+        return "equation"
 
     manual = (paragraph or {}).get("manual_number") or (
         (manual_number_prefix(t) or {}).get("label"))
@@ -113,7 +149,7 @@ def regex_role(text, paragraph=None):
         if is_long or ends_sentence:
             return "body"
         if metadata_heading:
-            return metadata_heading
+            return "chapter_heading" if profile == "thesis" and metadata_heading == "heading_1" else metadata_heading
         if _numbered_body_evidence(paragraph):
             return "body"
         return None
@@ -123,11 +159,11 @@ def regex_role(text, paragraph=None):
         if is_long or ends_sentence:
             return "body"
         if metadata_heading:
-            return metadata_heading
+            return "chapter_heading" if profile == "thesis" and metadata_heading == "heading_1" else metadata_heading
         # 公文标题编号惯例（一、/（一））优先于"正文列表"推断
         auto_heading = _auto_number_heading_role(paragraph)
         if auto_heading:
-            return auto_heading
+            return "chapter_heading" if profile == "thesis" and auto_heading == "heading_1" else auto_heading
         if _numbered_body_evidence(paragraph):
             return "body"
 
@@ -135,10 +171,10 @@ def regex_role(text, paragraph=None):
         return None
     for pat, role in _HEADING_PATTERNS:
         if pat.match(t):
-            return role
+            return "chapter_heading" if profile == "thesis" and role == "heading_1" else role
     return None
 
-PROMPT_TEMPLATE = """你是文档结构标注器。给每一段标注角色，角色只能从枚举里选:
+PROMPT_TEMPLATE = """你是文档结构标注器。当前文档 profile={profile}。给每一段标注角色，角色只能从枚举里选:
 {roles}。
 判断依据: 文字内容、位置顺序、当前格式提示。落款单位通常在末尾、署名感强;
 日期含"年/月/日"; 标题通常在最前且独立成行。
@@ -150,6 +186,9 @@ numbering_status=automatic 是真 Word 自动编号；cancelled 表示 numId=0 �
 它不是自动编号。list_kind=manual 表示数字是文本内容，不能擅自删除。
 "图1 xxx"/"图2-1 xxx"这类独立成行的是图片题注(figure_caption)，"表1 xxx"是表格题注
 (table_caption)。
+论文中摘要标题/摘要正文/关键词分别使用 abstract_heading、abstract_body、keywords；
+章标题使用 chapter_heading；“参考文献”及其 [1] 条目分别使用
+bibliography_heading、bibliography_entry；公式与附录标题使用 equation、appendix_heading。
 输入是 JSON 数组，包含文本/字数/样式/大纲级别、list_kind、numbering_status、
 num_id/num_level/num_format/level_text、手工前缀、是否连续序列以及段落/编号缩进。
 输出严格为 {{"roles": [{{"idx": 0, "role": "title"}}, ...]}} 的 JSON 对象，
@@ -195,12 +234,13 @@ def _validate_rolemap(items, expected_idxs):
     return rolemap
 
 
-def _label_batch(batch, llm, max_retries=2, on_event=None):
+def _label_batch(batch, llm, max_retries=2, on_event=None, profile="general"):
     on_event = on_event or (lambda msg: None)
     expected = [p["idx"] for p in batch]
     metadata_fields = (
         "idx", "text", "char_count", "ends_with_sentence_punct",
-        "size_pt", "bold", "alignment", "style_name", "outline_level",
+        "size_pt", "bold", "italic", "underline", "color", "alignment",
+        "style_name", "outline_level",
         "space_before_pt", "space_after_pt", "list_kind", "manual_number",
         "list_sequence", "numbering_status", "numbering_source", "num_id",
         "num_level", "num_format", "level_text", "indent_left_twips",
@@ -211,7 +251,8 @@ def _label_batch(batch, llm, max_retries=2, on_event=None):
     payload = json.dumps(
         [{key: p.get(key) for key in metadata_fields} for p in batch],
         ensure_ascii=False)
-    prompt = PROMPT_TEMPLATE.format(roles="/".join(BASE_ROLES), paragraphs=payload)
+    prompt = PROMPT_TEMPLATE.format(
+        roles="/".join(BASE_ROLES), paragraphs=payload, profile=profile)
     last_err = None
     for attempt in range(max_retries + 1):
         try:
@@ -221,21 +262,23 @@ def _label_batch(batch, llm, max_retries=2, on_event=None):
             last_err = e
             if attempt < max_retries:
                 on_event(f"角色标注未通过校验（{e}），正在要求模型重标")
-                prompt = (PROMPT_TEMPLATE.format(roles="/".join(BASE_ROLES), paragraphs=payload)
+                prompt = (PROMPT_TEMPLATE.format(
+                    roles="/".join(BASE_ROLES), paragraphs=payload, profile=profile)
                           + RETRY_SUFFIX.format(error=e, idx_list=expected))
     raise ValueError(f"角色标注失败（重试 {max_retries} 次后放弃）: {last_err}")
 
 
-def label_roles(paragraphs, llm, on_event=None):
+def label_roles(paragraphs, llm, on_event=None, profile=None):
     """整篇段落清单 → {idx: role}。表格内段落（in_table=True）不送标注，直接标 other。"""
     on_event = on_event or (lambda msg: None)
+    profile = profile or detect_document_profile(paragraphs)
     rolemap = {}
     todo = []
     for p in paragraphs:
         if p.get("in_table"):
             rolemap[p["idx"]] = "other"
             continue
-        hit = regex_role(p.get("text", ""), p)
+        hit = regex_role(p.get("text", ""), p, profile=profile)
         if hit:
             rolemap[p["idx"]] = hit  # 编号惯例命中的标题：确定性识别，不送 LLM
         else:
@@ -247,7 +290,8 @@ def label_roles(paragraphs, llm, on_event=None):
         batch_no = i // BATCH_SIZE + 1
         if n_batches > 1:
             on_event(f"标注第 {batch_no}/{n_batches} 批段落（{len(todo[i:i + BATCH_SIZE])} 段）")
-        rolemap.update(_label_batch(todo[i:i + BATCH_SIZE], llm, on_event=on_event))
+        rolemap.update(_label_batch(
+            todo[i:i + BATCH_SIZE], llm, on_event=on_event, profile=profile))
     return rolemap
 
 

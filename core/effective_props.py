@@ -1,7 +1,7 @@
 # 读段落"生效属性"——合并 样式继承链(basedOn) -> 段落样式 -> run 直刷格式。
 # 这是"读模板得数值"的核心, 也是方案第6节"读生效属性而非样式名"的具体实现。
 # 用法: get_paragraph_effective_font(paragraph) -> ("仿宋_GB2312", 16.0, False)
-# 已知边界(v1 接受): 不读 styles.xml 的 docDefaults(文档默认字体), 不读对齐/行距/缩进。
+# 已知边界: 不读 styles.xml 的 docDefaults(文档默认字体), 不读对齐/行距/缩进。
 from docx.oxml.ns import qn
 
 _OFF_VALUES = ("0", "false", "off", "none")
@@ -22,7 +22,7 @@ def _merge(base, direct):
 
 
 def _read_rpr(rpr):
-    """从一个 rPr 元素读字体/字号/加粗, 返回 dict (只含有值项)。
+    """从一个 rPr 元素读常用字符属性, 返回 dict (只含有值项)。
     注意: w:b 元素不存在时不写 bold 键——"没说"不等于"不加粗", 要留给下层决定。
     """
     props = {}
@@ -38,6 +38,21 @@ def _read_rpr(rpr):
     b = rpr.find(qn("w:b"))
     if b is not None:
         props["bold"] = _is_on(b)  # 显式 w:b w:val="0" 才是"取消加粗"
+    for tag, key in (("w:i", "italic"), ("w:strike", "strike")):
+        element = rpr.find(qn(tag))
+        if element is not None:
+            props[key] = _is_on(element)
+    underline = rpr.find(qn("w:u"))
+    if underline is not None:
+        props["underline"] = underline.get(qn("w:val"), "single") not in _OFF_VALUES
+    color = rpr.find(qn("w:color"))
+    if color is not None:
+        value = color.get(qn("w:val"))
+        if value and value.lower() != "auto":
+            props["color"] = value.upper()
+    highlight = rpr.find(qn("w:highlight"))
+    if highlight is not None and highlight.get(qn("w:val")):
+        props["highlight"] = highlight.get(qn("w:val"))
     return props
 
 

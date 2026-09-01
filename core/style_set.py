@@ -7,12 +7,14 @@
 import hashlib
 import re
 from collections import Counter
+from copy import deepcopy
 
 from docx.enum.style import WD_STYLE_TYPE
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt
+from docx.shared import Pt, RGBColor
+from docx.text.run import Run
 
 from core.numbering import (
     clear_style_numbering,
@@ -34,6 +36,14 @@ ROLE_STYLE_NAMES = {
     "attachment": "附件正文",
     "figure_caption": "图题",
     "table_caption": "表题",
+    "abstract_heading": "摘要标题",
+    "abstract_body": "摘要正文",
+    "keywords": "关键词",
+    "chapter_heading": "章标题",
+    "bibliography_heading": "参考文献标题",
+    "bibliography_entry": "参考文献条目",
+    "equation": "公式",
+    "appendix_heading": "附录标题",
     "other": "其他正文",
 }
 
@@ -50,6 +60,14 @@ ROLE_STYLE_IDS = {
     "attachment": "FormatAgentAttachment",
     "figure_caption": "FormatAgentFigureCaption",
     "table_caption": "FormatAgentTableCaption",
+    "abstract_heading": "FormatAgentAbstractHeading",
+    "abstract_body": "FormatAgentAbstractBody",
+    "keywords": "FormatAgentKeywords",
+    "chapter_heading": "FormatAgentChapterHeading",
+    "bibliography_heading": "FormatAgentBibliographyHeading",
+    "bibliography_entry": "FormatAgentBibliographyEntry",
+    "equation": "FormatAgentEquation",
+    "appendix_heading": "FormatAgentAppendixHeading",
     "other": "FormatAgentOther",
 }
 
@@ -60,6 +78,9 @@ DEFAULT_OUTLINE_LEVELS = {
     "heading_1": 0,
     "heading_2": 1,
     "heading_3": 2,
+    "chapter_heading": 0,
+    "bibliography_heading": 0,
+    "appendix_heading": 0,
 }
 
 _ALIGNMENT = {
@@ -194,7 +215,7 @@ def _get_or_add(parent, tag):
     return el
 
 
-def _set_style_font(style, rule):
+def _set_style_font(style, rule, cleanup_mode="controlled"):
     rpr = style.element.get_or_add_rPr()
     rfonts = _get_or_add(rpr, "w:rFonts")
     eastasia = rule.get("font_eastasia")
@@ -214,6 +235,37 @@ def _set_style_font(style, rule):
         sz_cs.set(qn("w:val"), str(int(round(float(size_pt) * 2))))
     if rule.get("bold") is not None:
         style.font.bold = bool(rule["bold"])
+    elif cleanup_mode == "strict":
+        style.font.bold = False
+    if rule.get("italic") is not None:
+        style.font.italic = bool(rule["italic"])
+    elif cleanup_mode == "strict":
+        style.font.italic = False
+    if rule.get("underline") is not None:
+        style.font.underline = bool(rule["underline"])
+    elif cleanup_mode == "strict":
+        style.font.underline = False
+    if rule.get("strike") is not None:
+        style.font.strike = bool(rule["strike"])
+    elif cleanup_mode == "strict":
+        style.font.strike = False
+    color = rule.get("color")
+    if color:
+        style.font.color.rgb = RGBColor.from_string(color.upper())
+    elif cleanup_mode == "strict":
+        style.font.color.rgb = RGBColor(0, 0, 0)
+    if rule.get("highlight") is not None:
+        highlight = rpr.find(qn("w:highlight"))
+        if highlight is None:
+            highlight = OxmlElement("w:highlight")
+            # CT_RPr 要求 highlight 位于 underline 之前；直接 append 会使
+            # Word 进入“发现不可读内容”的修复模式并删除整批自定义样式。
+            underline = rpr.find(qn("w:u"))
+            if underline is not None:
+                rpr.insert(list(rpr).index(underline), highlight)
+            else:
+                rpr.append(highlight)
+        highlight.set(qn("w:val"), str(rule["highlight"]))
 
 
 def _set_style_paragraph_format(style, rule, outline_level):
@@ -233,11 +285,35 @@ def _set_style_paragraph_format(style, rule, outline_level):
 
     ppr = style.element.get_or_add_pPr()
     chars = rule.get("first_line_indent_chars")
-    if chars is not None:
+    hanging_chars = rule.get("hanging_indent_chars")
+    left_chars = rule.get("left_indent_chars")
+    if hanging_chars is not None:
+        left_chars = hanging_chars if left_chars is None else left_chars
+        ind = ppr.get_or_add_ind()
+        size_pt = float(rule.get("size_pt") or 16)
+        ind.set(qn("w:leftChars"), str(int(round(float(left_chars) * 100))))
+        ind.set(qn("w:left"), str(int(round(size_pt * float(left_chars) * 20))))
+        ind.set(qn("w:hangingChars"), str(int(round(float(hanging_chars) * 100))))
+        ind.set(qn("w:hanging"), str(int(round(size_pt * float(hanging_chars) * 20))))
+    elif chars is not None:
         ind = ppr.get_or_add_ind()
         ind.set(qn("w:firstLineChars"), str(int(round(float(chars) * 100))))
         size_pt = float(rule.get("size_pt") or 16)
         ind.set(qn("w:firstLine"), str(int(round(size_pt * float(chars) * 20))))
+    elif left_chars is not None:
+        ind = ppr.get_or_add_ind()
+        size_pt = float(rule.get("size_pt") or 16)
+        ind.set(qn("w:leftChars"), str(int(round(float(left_chars) * 100))))
+        ind.set(qn("w:left"), str(int(round(size_pt * float(left_chars) * 20))))
+
+    for field, attr in (
+        ("keep_with_next", "keep_with_next"),
+        ("keep_together", "keep_together"),
+        ("page_break_before", "page_break_before"),
+        ("widow_control", "widow_control"),
+    ):
+        if rule.get(field) is not None:
+            setattr(pf, attr, bool(rule[field]))
 
     outline = ppr.get_or_add_outlineLvl() if outline_level is not None else None
     if outline is not None:
@@ -252,6 +328,7 @@ def ensure_role_styles(document, spec, target_body_style=None):
     if target_body_style.type != WD_STYLE_TYPE.PARAGRAPH:
         raise ValueError("目标正文样式必须是段落样式")
     roles = spec.get("roles") or {}
+    cleanup_mode = (spec.get("cleanup") or {}).get("mode", "controlled")
     for role, rule in roles.items():
         name = style_name_for_role(role, rule)
         if name in used_names:
@@ -267,7 +344,7 @@ def ensure_role_styles(document, spec, target_body_style=None):
         if based_on is not None:
             style.element.remove(based_on)
         outline_level = rule.get("outline_level", DEFAULT_OUTLINE_LEVELS.get(role))
-        _set_style_font(style, rule)
+        _set_style_font(style, rule, cleanup_mode=cleanup_mode)
         _set_style_paragraph_format(style, rule, outline_level)
         clear_style_numbering(style)
         result[role] = style
@@ -291,7 +368,9 @@ def _remove_if_empty(parent, child):
         parent.remove(child)
 
 
-def _clear_rpr_controlled_fields(rpr, controlled, linked_style_ids=None):
+def _clear_rpr_controlled_fields(
+    rpr, controlled, linked_style_ids=None, remove_character_style=False,
+):
     if rpr is None:
         return
     tags = list(controlled)
@@ -300,22 +379,53 @@ def _clear_rpr_controlled_fields(rpr, controlled, linked_style_ids=None):
         if el is not None:
             rpr.remove(el)
     rstyle = rpr.find(qn("w:rStyle"))
-    if (
-        rstyle is not None
-        and linked_style_ids
-        and rstyle.get(qn("w:val")) in linked_style_ids
+    if rstyle is not None and (
+        remove_character_style
+        or linked_style_ids and rstyle.get(qn("w:val")) in linked_style_ids
     ):
         rpr.remove(rstyle)
 
 
-def _clear_run_overrides(paragraph, rule, clear_character_style=False):
-    controlled = []
+_STRICT_RPR_TAGS = {
+    qn(tag) for tag in (
+        "w:rFonts", "w:sz", "w:szCs", "w:b", "w:bCs", "w:i", "w:iCs",
+        "w:u", "w:color", "w:highlight", "w:strike", "w:dstrike",
+        "w:caps", "w:smallCaps", "w:vanish", "w:outline", "w:shadow",
+        "w:emboss", "w:imprint", "w:position", "w:spacing", "w:w",
+        "w:kern", "w:shd",
+    )
+}
+
+
+def _clear_run_overrides(
+    paragraph, rule, clear_character_style=False, cleanup_mode="controlled",
+):
+    controlled = set()
     if rule.get("font_eastasia") or rule.get("font_ascii"):
-        controlled.append(qn("w:rFonts"))
+        controlled.add(qn("w:rFonts"))
     if rule.get("size_pt") is not None:
-        controlled.extend((qn("w:sz"), qn("w:szCs")))
+        controlled.update((qn("w:sz"), qn("w:szCs")))
     if rule.get("bold") is not None:
-        controlled.extend((qn("w:b"), qn("w:bCs")))
+        controlled.update((qn("w:b"), qn("w:bCs")))
+    for field, tags in (
+        ("italic", ("w:i", "w:iCs")),
+        ("underline", ("w:u",)),
+        ("color", ("w:color",)),
+        ("highlight", ("w:highlight",)),
+        ("strike", ("w:strike", "w:dstrike")),
+    ):
+        if rule.get(field) is not None:
+            controlled.update(qn(tag) for tag in tags)
+    if cleanup_mode == "strict":
+        controlled.update(_STRICT_RPR_TAGS)
+    elif cleanup_mode == "preserve_emphasis":
+        # 保留作者刻意使用的粗体/斜体，其余异常直刷格式仍清理。
+        controlled.difference_update(
+            {qn("w:b"), qn("w:bCs"), qn("w:i"), qn("w:iCs")})
+        controlled.update(
+            tag for tag in _STRICT_RPR_TAGS
+            if tag not in {qn("w:b"), qn("w:bCs"), qn("w:i"), qn("w:iCs")}
+        )
     linked_style_ids = set()
     if clear_character_style:
         for style in paragraph.part.document.styles:
@@ -329,7 +439,9 @@ def _clear_run_overrides(paragraph, rule, clear_character_style=False):
         rpr = run._element.find(qn("w:rPr"))
         if rpr is None:
             continue
-        _clear_rpr_controlled_fields(rpr, controlled, linked_style_ids)
+        _clear_rpr_controlled_fields(
+            rpr, controlled, linked_style_ids,
+            remove_character_style=cleanup_mode == "strict")
         _remove_if_empty(run._element, rpr)
 
     # Word 还允许在段落标记 pPr/rPr 上保存字符样式。旧文件中的
@@ -337,36 +449,67 @@ def _clear_run_overrides(paragraph, rule, clear_character_style=False):
     ppr = paragraph._p.pPr
     mark_rpr = ppr.find(qn("w:rPr")) if ppr is not None else None
     if mark_rpr is not None:
-        _clear_rpr_controlled_fields(mark_rpr, controlled, linked_style_ids)
+        _clear_rpr_controlled_fields(
+            mark_rpr, controlled, linked_style_ids,
+            remove_character_style=cleanup_mode == "strict")
         _remove_if_empty(ppr, mark_rpr)
 
 
-def _clear_paragraph_overrides(paragraph, rule, remove_numbering=False):
+def _clear_paragraph_overrides(
+    paragraph, rule, remove_numbering=False, cleanup_mode="controlled",
+):
     ppr = paragraph._p.get_or_add_pPr()
-    if rule.get("alignment") in _ALIGNMENT:
+    strict = cleanup_mode == "strict"
+    if strict or rule.get("alignment") in _ALIGNMENT:
         jc = ppr.find(qn("w:jc"))
         if jc is not None:
             ppr.remove(jc)
 
     spacing = ppr.find(qn("w:spacing"))
     if spacing is not None:
-        if isinstance(rule.get("line_spacing"), dict):
+        if strict or isinstance(rule.get("line_spacing"), dict):
             spacing.attrib.pop(qn("w:line"), None)
             spacing.attrib.pop(qn("w:lineRule"), None)
-        if rule.get("space_before_pt") is not None:
+        if strict or rule.get("space_before_pt") is not None:
             spacing.attrib.pop(qn("w:before"), None)
-        if rule.get("space_after_pt") is not None:
+        if strict or rule.get("space_after_pt") is not None:
             spacing.attrib.pop(qn("w:after"), None)
         _remove_if_empty(ppr, spacing)
 
-    if rule.get("first_line_indent_chars") is not None:
+    if strict or any(
+        rule.get(field) is not None for field in (
+            "first_line_indent_chars", "left_indent_chars", "hanging_indent_chars"
+        )
+    ):
         ind = ppr.find(qn("w:ind"))
         if ind is not None:
-            ind.attrib.pop(qn("w:firstLineChars"), None)
-            ind.attrib.pop(qn("w:firstLine"), None)
-            ind.attrib.pop(qn("w:hanging"), None)
-            ind.attrib.pop(qn("w:hangingChars"), None)
-            _remove_if_empty(ppr, ind)
+            if strict:
+                ppr.remove(ind)
+            else:
+                for attr in (
+                    "w:firstLineChars", "w:firstLine", "w:hanging",
+                    "w:hangingChars", "w:left", "w:leftChars", "w:start",
+                    "w:startChars",
+                ):
+                    ind.attrib.pop(qn(attr), None)
+                _remove_if_empty(ppr, ind)
+
+    for field, tag in (
+        ("keep_with_next", "w:keepNext"),
+        ("keep_together", "w:keepLines"),
+        ("page_break_before", "w:pageBreakBefore"),
+        ("widow_control", "w:widowControl"),
+    ):
+        if strict or rule.get(field) is not None:
+            element = ppr.find(qn(tag))
+            if element is not None:
+                ppr.remove(element)
+
+    if strict:
+        for tag in ("w:contextualSpacing", "w:shd", "w:pBdr", "w:textAlignment"):
+            element = ppr.find(qn(tag))
+            if element is not None:
+                ppr.remove(element)
 
     # 大纲层级由命名样式提供，段落本身不再直刷 outlineLvl。
     outline = ppr.find(qn("w:outlineLvl"))
@@ -446,23 +589,84 @@ def _strip_manual_number_prefix(paragraph, role):
     return False
 
 
-def apply_named_style(paragraph, style, rule, role=None):
+def _split_plain_run_at(paragraph, offset):
+    """在段落字符偏移处拆分纯文本 run；遇到域、换行、绘图等复杂 run 则放弃。"""
+    cursor = 0
+    for run in list(paragraph.runs):
+        text = run.text
+        end = cursor + len(text)
+        if cursor < offset < end:
+            payload = [child for child in run._element if child.tag != qn("w:rPr")]
+            if any(child.tag != qn("w:t") for child in payload):
+                return False
+            clone = deepcopy(run._element)
+            run._element.addnext(clone)
+            suffix = Run(clone, paragraph)
+            cut = offset - cursor
+            run.text = text[:cut]
+            suffix.text = text[cut:]
+            return True
+        if offset == end:
+            return True
+        cursor = end
+    return offset == cursor
+
+
+def _apply_label_prefix(paragraph, rule):
+    prefix_rule = rule.get("label_prefix")
+    if not isinstance(prefix_rule, dict):
+        return False
+    options = prefix_rule.get("text")
+    options = [options] if isinstance(options, str) else list(options or [])
+    prefix = next((item for item in options if paragraph.text.startswith(item)), None)
+    if not prefix or not _split_plain_run_at(paragraph, len(prefix)):
+        return False
+
+    cursor = 0
+    for run in paragraph.runs:
+        end = cursor + len(run.text)
+        in_prefix = end <= len(prefix) and end > 0
+        for field in ("bold", "italic", "underline"):
+            if prefix_rule.get(field) is not None:
+                setattr(run.font, field, bool(prefix_rule[field]) if in_prefix else None)
+        if prefix_rule.get("color") is not None:
+            run.font.color.rgb = (
+                RGBColor.from_string(prefix_rule["color"].upper()) if in_prefix else None)
+        cursor = end
+    return True
+
+
+def apply_named_style(
+    paragraph, style, rule, role=None, cleanup_mode="controlled",
+):
     """绑定命名样式并清除会遮蔽该样式的直接格式，返回受控字段列表。"""
     clear_character_style = role in {
-        "title", "subtitle", "heading_1", "heading_2", "heading_3"
+        "title", "subtitle", "heading_1", "heading_2", "heading_3",
+        "abstract_heading", "chapter_heading", "bibliography_heading",
+        "appendix_heading",
     }
     _clear_run_overrides(
-        paragraph, rule, clear_character_style=clear_character_style)
+        paragraph, rule, clear_character_style=clear_character_style,
+        cleanup_mode=cleanup_mode)
     invalid_numbering_removed = (
         clear_invalid_numbering_override(paragraph) if role == "body" else False)
     has_numbering = isinstance(rule.get("numbering"), dict)
     stripped_prefix = _strip_manual_number_prefix(paragraph, role) if has_numbering else False
     remove_numbering = has_numbering or role in {
-        "title", "subtitle", "heading_1", "heading_2", "heading_3"
+        "title", "subtitle", "heading_1", "heading_2", "heading_3",
+        "abstract_heading", "chapter_heading", "bibliography_heading",
+        "appendix_heading",
     }
-    _clear_paragraph_overrides(paragraph, rule, remove_numbering=remove_numbering)
+    _clear_paragraph_overrides(
+        paragraph, rule, remove_numbering=remove_numbering,
+        cleanup_mode=cleanup_mode)
     paragraph.style = style
+    label_prefix_applied = _apply_label_prefix(paragraph, rule)
     fields = ["paragraph_style"]
+    if cleanup_mode != "controlled":
+        fields.append(f"cleanup_{cleanup_mode}")
+    if label_prefix_applied:
+        fields.append("label_prefix")
     if has_numbering:
         fields.append("automatic_numbering")
     if stripped_prefix:
@@ -472,8 +676,11 @@ def apply_named_style(paragraph, style, rule, role=None):
     fields.extend(
         field for field in (
             "font_eastasia", "font_ascii", "size_pt", "bold", "alignment",
+            "italic", "underline", "color", "highlight", "strike",
             "line_spacing", "space_before_pt", "space_after_pt",
-            "first_line_indent_chars", "outline_level",
+            "first_line_indent_chars", "left_indent_chars", "hanging_indent_chars",
+            "keep_with_next", "keep_together", "page_break_before",
+            "widow_control", "outline_level",
         )
         if rule.get(field) is not None
     )

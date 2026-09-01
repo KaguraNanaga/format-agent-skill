@@ -4,12 +4,18 @@
 #   - 数值边界：size_pt ∈ [8,72]、margin ∈ [5,50]mm、first_line_indent_chars ∈ [0,8]
 #   - 非法输出带校验错误回喂 LLM 重试（由调用方负责重试）
 
+import re
+
 # 角色 Base 闭集；规范文字可自定义角色键（执行器对未知角色按 other 处理），
 # 所以这里只对 Base 角色做提示，不拒绝未知键。
 BASE_ROLES = [
     "title", "subtitle", "heading_1", "heading_2", "heading_3",
     "body", "signature", "date", "attachment_label", "attachment",
     "figure_caption", "table_caption", "other",
+    # 论文专用语义角色。保留通用 heading/body 以兼容既有 RoleMap。
+    "abstract_heading", "abstract_body", "keywords", "chapter_heading",
+    "bibliography_heading", "bibliography_entry", "equation",
+    "appendix_heading",
 ]
 
 ROLE_REQUIRED_FIELDS = ["font_eastasia", "size_pt", "alignment"]
@@ -21,6 +27,17 @@ MARGIN_MM_RANGE = (5, 50)
 INDENT_CHARS_RANGE = (0, 8)
 NUMBERING_SUFFIXES = {"tab", "space", "nothing"}
 NUMBERING_ALIGNMENTS = {"left", "center", "right"}
+CLEANUP_MODES = {"controlled", "strict", "preserve_emphasis"}
+PAGE_NUMBER_FORMATS = {"decimal", "upperRoman", "lowerRoman", "upperLetter", "lowerLetter"}
+BOOLEAN_ROLE_FIELDS = {
+    "bold", "italic", "underline", "strike", "keep_with_next",
+    "keep_together", "page_break_before", "widow_control",
+}
+HIGHLIGHT_VALUES = {
+    "black", "blue", "cyan", "green", "magenta", "red", "yellow", "white",
+    "darkBlue", "darkCyan", "darkGreen", "darkMagenta", "darkRed", "darkYellow",
+    "darkGray", "lightGray", "none",
+}
 
 
 class SpecValidationError(Exception):
@@ -34,6 +51,81 @@ def validate_spec(spec):
     errors = []
     if not isinstance(spec, dict):
         raise SpecValidationError(["顶层必须是 JSON object"])
+
+    # ---- cleanup ----
+    cleanup = spec.get("cleanup")
+    if cleanup is not None:
+        if not isinstance(cleanup, dict):
+            errors.append("cleanup 必须是 object")
+        elif cleanup.get("mode") not in CLEANUP_MODES:
+            errors.append(
+                f"cleanup.mode={cleanup.get('mode')!r} 非法："
+                f"必须是 {sorted(CLEANUP_MODES)} 之一")
+
+    profile = spec.get("profile")
+    if profile is not None and profile not in {"general", "thesis"}:
+        errors.append("profile 必须是 'general' 或 'thesis'")
+
+    # ---- structure（论文前置页、多节、页眉页码）----
+    structure = spec.get("structure")
+    if structure is not None:
+        if not isinstance(structure, dict):
+            errors.append("structure 必须是 object")
+        else:
+            enabled = structure.get("enabled")
+            if enabled is not None and not isinstance(enabled, bool):
+                errors.append("structure.enabled 必须是 boolean")
+            mode = structure.get("mode")
+            if mode is not None and mode != "thesis":
+                errors.append("structure.mode 当前只支持 'thesis'")
+            for key in ("cover", "front_matter", "page_numbering", "running_header"):
+                value = structure.get(key)
+                if value is not None and not isinstance(value, dict):
+                    errors.append(f"structure.{key} 必须是 object")
+            cover = structure.get("cover")
+            if isinstance(cover, dict):
+                for key in ("enabled", "logo"):
+                    value = cover.get(key)
+                    if value is not None and not isinstance(value, bool):
+                        errors.append(f"structure.cover.{key} 必须是 boolean")
+                for key in ("institution", "type_label", "date_text"):
+                    value = cover.get(key)
+                    if value is not None and not isinstance(value, str):
+                        errors.append(f"structure.cover.{key} 必须是 string")
+                metadata = cover.get("metadata")
+                if metadata is not None and (
+                    not isinstance(metadata, dict)
+                    or any(not isinstance(k, str) or not isinstance(v, str)
+                           for k, v in metadata.items())
+                ):
+                    errors.append("structure.cover.metadata 必须是 string → string object")
+            front = structure.get("front_matter")
+            if isinstance(front, dict):
+                for key in ("abstract", "toc", "declarations"):
+                    value = front.get(key)
+                    if value is not None and not isinstance(value, bool):
+                        errors.append(f"structure.front_matter.{key} 必须是 boolean")
+            numbering = structure.get("page_numbering")
+            if isinstance(numbering, dict):
+                for key in ("front_format", "body_format"):
+                    value = numbering.get(key)
+                    if value is not None and value not in PAGE_NUMBER_FORMATS:
+                        errors.append(
+                            f"structure.page_numbering.{key} 必须是 "
+                            f"{sorted(PAGE_NUMBER_FORMATS)} 之一")
+                for key in ("front_start", "body_start"):
+                    value = numbering.get(key)
+                    if value is not None and (
+                        not isinstance(value, int) or isinstance(value, bool)
+                        or not (0 <= value <= 10000)
+                    ):
+                        errors.append(f"structure.page_numbering.{key} 必须是 0~10000 的整数")
+            header = structure.get("running_header")
+            if isinstance(header, dict):
+                for key in ("left_text", "chapter_style_name"):
+                    value = header.get(key)
+                    if value is not None and not isinstance(value, str):
+                        errors.append(f"structure.running_header.{key} 必须是 string")
 
     # ---- page ----
     page = spec.get("page")
@@ -130,6 +222,59 @@ def validate_spec(spec):
             if v is not None and (not _is_num(v) or not (INDENT_CHARS_RANGE[0] <= v <= INDENT_CHARS_RANGE[1])):
                 errors.append(
                     f"roles.{role}.first_line_indent_chars={v!r} 非法：必须是 {INDENT_CHARS_RANGE[0]}~{INDENT_CHARS_RANGE[1]} 字符")
+            for f in ("left_indent_chars", "hanging_indent_chars"):
+                v = rule.get(f)
+                if v is not None and (
+                    not _is_num(v) or not (INDENT_CHARS_RANGE[0] <= v <= INDENT_CHARS_RANGE[1])
+                ):
+                    errors.append(
+                        f"roles.{role}.{f}={v!r} 非法：必须是 "
+                        f"{INDENT_CHARS_RANGE[0]}~{INDENT_CHARS_RANGE[1]} 字符")
+            for f in BOOLEAN_ROLE_FIELDS:
+                v = rule.get(f)
+                if v is not None and not isinstance(v, bool):
+                    errors.append(f"roles.{role}.{f} 必须是 boolean")
+            color = rule.get("color")
+            if color is not None and (
+                not isinstance(color, str) or not re.fullmatch(r"[0-9A-Fa-f]{6}", color)
+            ):
+                errors.append(f"roles.{role}.color 必须是 6 位十六进制 RGB（如 000000）")
+            highlight = rule.get("highlight")
+            if highlight is not None and highlight not in HIGHLIGHT_VALUES:
+                errors.append(
+                    f"roles.{role}.highlight={highlight!r} 非法："
+                    f"必须是 Word 高亮颜色枚举之一")
+            label_prefix = rule.get("label_prefix")
+            if label_prefix is not None:
+                if not isinstance(label_prefix, dict):
+                    errors.append(f"roles.{role}.label_prefix 必须是 object")
+                else:
+                    text = label_prefix.get("text")
+                    valid_text = (
+                        isinstance(text, str) and bool(text)
+                        or isinstance(text, list) and bool(text)
+                        and all(isinstance(item, str) and item for item in text)
+                    )
+                    if not valid_text:
+                        errors.append(
+                            f"roles.{role}.label_prefix.text 必须是非空字符串或非空字符串数组")
+                    for f in ("bold", "italic", "underline"):
+                        v = label_prefix.get(f)
+                        if v is not None and not isinstance(v, bool):
+                            errors.append(f"roles.{role}.label_prefix.{f} 必须是 boolean")
+                    prefix_color = label_prefix.get("color")
+                    if prefix_color is not None and (
+                        not isinstance(prefix_color, str)
+                        or not re.fullmatch(r"[0-9A-Fa-f]{6}", prefix_color)
+                    ):
+                        errors.append(
+                            f"roles.{role}.label_prefix.color 必须是 6 位十六进制 RGB")
+            if (
+                rule.get("first_line_indent_chars") not in (None, 0)
+                and rule.get("hanging_indent_chars") not in (None, 0)
+            ):
+                errors.append(
+                    f"roles.{role} 不能同时设置首行缩进和悬挂缩进")
             ls = rule.get("line_spacing")
             if ls is not None:
                 if not isinstance(ls, dict) or ls.get("type") not in ("exact", "multiple") or not _is_num(ls.get("pt")):

@@ -30,13 +30,17 @@ class Agent:
 
     def run(self, target_path, out_path, spec_text=None, spec=None,
             template_path=None, template_rolemap=None, rolemap=None,
-            verify=False, report_path=None):
+            verify=False, report_path=None, cleanup_mode=None,
+            refresh_fields=False):
         """跑完整流程，返回结果 dict（spec/rolemap/changelog/issues/paths）。"""
         report_path = report_path or os.path.splitext(out_path)[0] + "_report.md"
 
         # ① 理解格式规范 → FormatSpec
         self._emit("理解规范", "开始理解格式来源，抽取格式规则 ...")
         if spec is not None:
+            if cleanup_mode is not None:
+                spec = dict(spec)
+                spec["cleanup"] = {"mode": cleanup_mode}
             validate_spec(spec)
             self._emit("理解规范", "FormatSpec 由用户直接给定（JSON），校验通过", status="ok")
         elif template_path is not None:
@@ -63,6 +67,11 @@ class Agent:
         else:
             raise ValueError("必须提供 spec_text / spec / template_path 之一")
 
+        if cleanup_mode is not None and (spec.get("cleanup") or {}).get("mode") != cleanup_mode:
+            spec = dict(spec)
+            spec["cleanup"] = {"mode": cleanup_mode}
+            validate_spec(spec)
+
         # ② 解析目标文档结构
         self._emit("解析文档", "正在解析目标文档结构 ...")
         paragraphs = extract_paragraphs(target_path)
@@ -88,7 +97,8 @@ class Agent:
             from core.label_roles import label_roles
             rolemap = label_roles(
                 paragraphs, self._get_llm(),
-                on_event=lambda m: self._emit("标注角色", m))
+                on_event=lambda m: self._emit("标注角色", m),
+                profile=spec.get("profile"))
             counts = {}
             for r in rolemap.values():
                 counts[r] = counts.get(r, 0) + 1
@@ -97,7 +107,9 @@ class Agent:
 
         # ④ 确定性执行排版
         self._emit("执行排版", "正在按 FormatSpec × RoleMap 逐段改写文档（确定性代码，AI 不碰 docx）...")
-        changelog = apply_format(target_path, spec, rolemap, out_path)
+        changelog = apply_format(
+            target_path, spec, rolemap, out_path,
+            template_path=template_path)
         write_report(changelog, spec, report_path)
         # 同步产出：docx 检测报告 + 修订模式文档（Word 审阅视图可见改动）
         from core.report_docx import build_report_docx
@@ -105,7 +117,9 @@ class Agent:
         report_docx_path = base + "_report.docx"
         build_report_docx(changelog, spec, report_docx_path)
         tracked_path = base + "_tracked.docx"
-        apply_format(target_path, spec, rolemap, tracked_path, track=True)
+        apply_format(
+            target_path, spec, rolemap, tracked_path, track=True,
+            template_path=template_path)
         n_changed = sum(1 for c in changelog if c["changed_fields"])
         n_styles = len({c.get("style_name") for c in changelog if c.get("style_name")})
         self._emit("执行排版",
@@ -116,7 +130,8 @@ class Agent:
         # ④.5 文本一致性校验：排版只许改格式，正文一个字都不能动
         from core.text_integrity import check_text_integrity
         allowed_additions = []
-        if (spec.get("toc") or {}).get("enabled"):
+        if ((spec.get("toc") or {}).get("enabled")
+                and not (spec.get("structure") or {}).get("enabled")):
             allowed_additions = ["目录", "（在 Word 中右键此处选择「更新域」生成目录）"]
         # 手工编号被自动编号替换而剥掉的前缀属于预期内的文字变化
         expected_prefixes = []
@@ -125,6 +140,11 @@ class Agent:
         for p in paragraphs:
             if p["idx"] in changed_idxs and p.get("manual_number"):
                 expected_prefixes.append(str(p["manual_number"]))
+        structure_changes = [
+            c for c in changelog if c.get("role") == "structure"]
+        for change in structure_changes:
+            allowed_additions.extend(change.get("allowed_additions") or [])
+            expected_prefixes.extend(change.get("stripped_prefixes") or [])
         integrity = check_text_integrity(
             target_path, out_path,
             allowed_additions=allowed_additions,
@@ -136,6 +156,21 @@ class Agent:
                        f"文本一致性校验发现差异：新增 {len(integrity['added'])} 段、"
                        f"缺失 {len(integrity['removed'])} 段，请人工核对",
                        status="err", data=integrity)
+
+        field_refresh = None
+        if refresh_fields:
+            try:
+                from core.field_refresh import refresh_fields_word
+                field_refresh = refresh_fields_word(out_path)
+                self._emit(
+                    "刷新域",
+                    "已用 Microsoft Word 刷新目录、动态页眉和页码并保存",
+                    status="ok", data=field_refresh)
+            except RuntimeError as exc:
+                self._emit(
+                    "刷新域",
+                    f"字段未能预刷新：{exc}；文档将在 Word 打开时自动更新",
+                    status="warn")
 
         # ⑤ 视觉自检（可选，一轮定向修复，不做开放循环）
         # 注意：自检是加分项，失败（如模型不支持图片）不能拖垮已完成的排版结果。
@@ -161,11 +196,15 @@ class Agent:
                     if applied:
                         self._emit("视觉自检",
                                    f"已定向修复 {len(applied)} 项，正在重排 ...", status="warn")
-                        changelog = apply_format(target_path, spec, rolemap, out_path)
+                        changelog = apply_format(
+                            target_path, spec, rolemap, out_path,
+                            template_path=template_path)
                         write_report(changelog, spec, report_path)
                         from core.report_docx import build_report_docx
                         build_report_docx(changelog, spec, report_docx_path)
-                        apply_format(target_path, spec, rolemap, tracked_path, track=True)
+                        apply_format(
+                            target_path, spec, rolemap, tracked_path, track=True,
+                            template_path=template_path)
                         integrity = check_text_integrity(
                             target_path, out_path,
                             allowed_additions=allowed_additions,
@@ -174,6 +213,17 @@ class Agent:
                                    + ("，文本一致性校验通过" if integrity["ok"]
                                       else "，但文本一致性校验发现差异，请人工核对"),
                                    status="ok" if integrity["ok"] else "err")
+                        if refresh_fields:
+                            try:
+                                from core.field_refresh import refresh_fields_word
+                                field_refresh = refresh_fields_word(out_path)
+                                self._emit(
+                                    "刷新域", "修复后已重新刷新 Word 域",
+                                    status="ok", data=field_refresh)
+                            except RuntimeError as exc:
+                                self._emit(
+                                    "刷新域", f"修复后字段未能预刷新：{exc}",
+                                    status="warn")
                     else:
                         self._emit("视觉自检",
                                    "这些问题无法安全自动修复，已保留在问题清单中供人工处理",
@@ -211,6 +261,7 @@ class Agent:
             "stylemap": stylemap, "changelog": changelog,
             "issues": issues, "applied_fixes": applied,
             "text_integrity": integrity,
+            "field_refresh": field_refresh,
             "out_path": out_path, "report_path": report_path,
             "report_docx_path": report_docx_path, "tracked_path": tracked_path,
         }

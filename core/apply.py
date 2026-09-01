@@ -20,6 +20,23 @@ from core.track_changes import mark_paragraph_revision, snapshot_paragraph
 
 _HF_ALIGN = {"left": 0, "center": 1, "right": 2, "justify": 3}
 
+_ROLE_FALLBACKS = {
+    "abstract_heading": ("heading_1", "body"),
+    "abstract_body": ("body",),
+    "keywords": ("body",),
+    "chapter_heading": ("heading_1",),
+    "bibliography_heading": ("heading_1",),
+    "bibliography_entry": ("attachment", "body"),
+    "equation": ("body",),
+    "appendix_heading": ("heading_1",),
+}
+
+
+def _resolved_role(role, roles):
+    if role in roles:
+        return role
+    return next((candidate for candidate in _ROLE_FALLBACKS.get(role, ()) if candidate in roles), None)
+
 
 def _apply_header_footer(doc, page):
     """页眉页脚：text 写入（可选）+ 字体/字号/对齐；footer.page_number 插 PAGE 域。"""
@@ -209,7 +226,8 @@ def _insert_toc(doc, before_paragraph, levels=(1, 2)):
     return True
 
 
-def apply_format(docx_path, spec, rolemap, out_path, track=False):
+def apply_format(docx_path, spec, rolemap, out_path, track=False,
+                 template_path=None):
     """应用 FormatSpec × RoleMap，输出 docx，返回 changelog list[dict]。
     rolemap: {idx: role}（idx 对应 extract.py 的段落序号）。
     模板未明确指定的角色统一与正文保持一致（套用 body 规则与样式）。
@@ -221,6 +239,7 @@ def apply_format(docx_path, spec, rolemap, out_path, track=False):
     """
     doc = Document(docx_path)
     roles = spec.get("roles", {})
+    cleanup_mode = (spec.get("cleanup") or {}).get("mode", "controlled")
     # 必须在创建/更新 FormatAgent 样式之前解析，避免把新样式误认成目标原样式。
     target_body_style = resolve_target_body_style(doc, rolemap)
     role_styles = ensure_role_styles(
@@ -253,18 +272,21 @@ def apply_format(docx_path, spec, rolemap, out_path, track=False):
         if role is None:
             continue  # 未被标注的段落不动
         snapshot = snapshot_paragraph(p) if track else None
-        if role in roles:
-            rule = roles[role]
-            style = role_styles[role]
-            changed = apply_named_style(p, style, rule, role=role)
-            fallback_to_target_body = False
+        resolved_role = _resolved_role(role, roles)
+        if resolved_role is not None:
+            rule = roles[resolved_role]
+            style = role_styles[resolved_role]
+            changed = apply_named_style(
+                p, style, rule, role=role, cleanup_mode=cleanup_mode)
+            fallback_to_target_body = resolved_role != role
         else:
             # 模板未规定的角色与正文保持一致：套用 body 的规则和命名样式，
             # 同时清掉会遮蔽样式的直接格式（如原文自带的加粗/异体字）。
             # 真实自动编号保留（body 不在清编号集合内），仅清“取消编号”残留。
             body_rule = roles.get("body", {})
             body_style = role_styles.get("body", target_body_style)
-            changed = apply_named_style(p, body_style, body_rule, role="body")
+            changed = apply_named_style(
+                p, body_style, body_rule, role="body", cleanup_mode=cleanup_mode)
             style = body_style
             fallback_to_target_body = True
         if track:
@@ -281,13 +303,19 @@ def apply_format(docx_path, spec, rolemap, out_path, track=False):
     # ---- 目录 + 多栏（结构级，在段落样式完成后执行）----
     toc = spec.get("toc") or {}
     columns = page.get("columns")
-    want_toc = isinstance(toc, dict) and toc.get("enabled")
+    structure_enabled = bool((spec.get("structure") or {}).get("enabled"))
+    # 论文结构模式由 thesis_structure 生成独立目录节；不要再插一次旧版占位目录。
+    want_toc = (
+        isinstance(toc, dict) and toc.get("enabled") and not structure_enabled)
     want_cols = isinstance(columns, int) and columns >= 2
     if want_toc or want_cols:
         first_heading = None
         for idx, p in enumerate(doc.paragraphs):
             r = rolemap.get(idx, rolemap.get(str(idx)))
-            if r in ("heading_1", "heading_2", "heading_3"):
+            if r in (
+                "heading_1", "heading_2", "heading_3", "chapter_heading",
+                "bibliography_heading", "appendix_heading",
+            ):
                 first_heading = p
                 break
         if want_toc and first_heading is not None:
@@ -320,6 +348,25 @@ def apply_format(docx_path, spec, rolemap, out_path, track=False):
             "changed_fields": extra_changes,
             "fallback_to_target_body": False,
         })
+
+    # ---- 论文结构级：安全重建封面/前置页/目录/正文/参考文献 ----
+    # 放在段落样式之后执行，确保 STYLEREF 与 TOC 能引用稳定的命名样式。
+    if structure_enabled:
+        from core.thesis_structure import assemble_thesis_structure
+        structure_result = assemble_thesis_structure(
+            doc, spec, rolemap, template_path=template_path)
+        if structure_result:
+            changelog.append({
+                "idx": -2,
+                "role": "structure",
+                "style_name": "-",
+                "text": "论文封面/前置页/目录/分节/动态页眉页码",
+                "changed_fields": structure_result["changed_fields"],
+                "fallback_to_target_body": False,
+                "allowed_additions": structure_result["allowed_additions"],
+                "stripped_prefixes": structure_result["stripped_prefixes"],
+                "section_kinds": structure_result["section_kinds"],
+            })
 
     doc.save(out_path)
     return changelog

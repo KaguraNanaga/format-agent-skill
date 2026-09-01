@@ -9,6 +9,7 @@
 
 import difflib
 import re
+from collections import Counter
 
 from docx import Document
 
@@ -40,11 +41,12 @@ def check_text_integrity(source_path, out_path,
     out = paragraph_texts(out_path)
 
     # 剥掉合法新增段
-    allowed = {_norm(a) for a in allowed_additions}
+    # Counter 而不是 set：封面多个元数据字段可能合法地使用同一占位值。
+    allowed = Counter(_norm(a) for a in allowed_additions)
     out_filtered = []
     for t in out:
-        if t in allowed:
-            allowed.discard(t)  # 每处合法新增只抵消一次
+        if allowed[t] > 0:
+            allowed[t] -= 1  # 每个声明的合法新增只抵消一次
             continue
         out_filtered.append(t)
 

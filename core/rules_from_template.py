@@ -3,6 +3,8 @@
 # 字体/字号/加粗，用 python-docx 读对齐/行距/缩进，页面级读 section 页边距和行网格。
 # 未知/读不到的字段不编——留给 LLM 规范抽取或人肉 JSON 补。
 
+from copy import deepcopy
+
 from docx import Document
 from docx.enum.text import WD_LINE_SPACING
 from docx.oxml.ns import qn
@@ -276,6 +278,233 @@ def _para_spacing_pt(p, attr):
     return round(parsed / 20, 1) if parsed is not None else None
 
 
+def _ppr_toggle(p, tag):
+    element = _effective_ppr_child(p, tag)
+    if element is None:
+        return None
+    return element.get(qn("w:val"), "1") not in {"0", "false", "off"}
+
+
+def _paragraph_rule(doc, p, role):
+    props = effective_props(p)
+    size_pt = props.get("size_pt") or 10.5
+    rule = {
+        "font_eastasia": props.get("eastasia") or "宋体",
+        "size_pt": size_pt,
+        "bold": bool(props.get("bold")),
+    }
+    if props.get("ascii"):
+        rule["font_ascii"] = props["ascii"]
+    for field in ("italic", "underline", "strike"):
+        if props.get(field) is not None:
+            rule[field] = bool(props[field])
+    for field in ("color", "highlight"):
+        if props.get(field) is not None:
+            rule[field] = props[field]
+    alignment = _para_alignment(p)
+    if alignment:
+        rule["alignment"] = alignment
+    line_spacing = _para_line_spacing(p)
+    if line_spacing:
+        rule["line_spacing"] = line_spacing
+    first_indent = _para_indent_chars(p, size_pt)
+    if first_indent:
+        rule["first_line_indent_chars"] = first_indent
+    for field, attr in (("space_before_pt", "w:before"), ("space_after_pt", "w:after")):
+        value = _para_spacing_pt(p, attr)
+        if value is not None:
+            rule[field] = value
+    for field, tag in (
+        ("keep_with_next", "w:keepNext"),
+        ("keep_together", "w:keepLines"),
+        ("page_break_before", "w:pageBreakBefore"),
+        ("widow_control", "w:widowControl"),
+    ):
+        value = _ppr_toggle(p, tag)
+        if value is not None:
+            rule[field] = value
+    numbering = _numbering_rule(doc, p, role)
+    if numbering is not None:
+        rule["numbering"] = numbering
+    rule.setdefault("alignment", "justify" if role in {"body", "abstract_body"} else "left")
+    return rule
+
+
+def _detect_profile(doc):
+    texts = [p.text.strip().replace(" ", "") for p in doc.paragraphs if p.text.strip()]
+    signals = sum((
+        any(text == "摘要" or text.startswith("摘要：") for text in texts),
+        any(text.startswith(("关键词：", "关键字：")) for text in texts),
+        any(text == "参考文献" for text in texts),
+    ))
+    if any("学位论文" in text or "毕业论文" in text for text in texts):
+        signals += 2
+    return "thesis" if signals >= 2 else "general"
+
+
+def _section_page_numbering(section):
+    element = section._sectPr.find(qn("w:pgNumType"))
+    if element is None:
+        return {}
+    result = {}
+    if element.get(qn("w:fmt")):
+        result["format"] = element.get(qn("w:fmt"))
+    if element.get(qn("w:start")):
+        result["start"] = _int_or_none(element.get(qn("w:start")))
+    return result
+
+
+def _thesis_structure(doc):
+    """从论文模板提取可安全迁移的结构契约，不复制示例作者或声明内容。"""
+    institution = next((
+        paragraph.text.strip()
+        for paragraph in doc.paragraphs
+        if paragraph.text.strip()
+        and str(paragraph.style.name if paragraph.style is not None else "") == "主题"
+    ), "")
+    if not institution:
+        for section in doc.sections:
+            text = next((
+                paragraph.text.strip() for paragraph in section.header.paragraphs
+                if paragraph.text.strip()
+            ), "")
+            if text:
+                institution = text.split("\t", 1)[0].strip()
+                break
+    institution = institution or "学位论文"
+
+    front_numbering = {"format": "upperRoman", "start": 1}
+    body_numbering = {"format": "decimal", "start": 1}
+    for section in doc.sections:
+        page_numbering = _section_page_numbering(section)
+        if page_numbering.get("format") in {"upperRoman", "lowerRoman"}:
+            front_numbering.update(page_numbering)
+        if page_numbering.get("start") == 1 and page_numbering.get("format") not in {
+            "upperRoman", "lowerRoman", "upperLetter", "lowerLetter",
+        }:
+            body_numbering.update(page_numbering)
+
+    return {
+        "enabled": True,
+        "mode": "thesis",
+        "cover": {
+            "enabled": True,
+            "logo": True,
+            "institution": institution,
+            "type_label": institution,
+            "metadata": {
+                "姓名": "（待填写）",
+                "学号": "（待填写）",
+                "导师": "（待填写）",
+                "院系": "（待填写）",
+                "学科/专业": "（待填写）",
+                "申请学位": "（待填写）",
+            },
+            "date_text": "日期：____年__月__日",
+        },
+        "front_matter": {
+            "abstract": True,
+            "toc": True,
+            # 法律声明需要作者明确确认和签名，不能从示例模板盲拷贝。
+            "declarations": False,
+        },
+        "page_numbering": {
+            "front_format": front_numbering.get("format", "upperRoman"),
+            "front_start": front_numbering.get("start") or 1,
+            "body_format": body_numbering.get("format", "decimal"),
+            "body_start": body_numbering.get("start") or 1,
+        },
+        "running_header": {
+            "left_text": institution,
+            "chapter_style_name": "章标题",
+            "header_distance_mm": round(doc.sections[0].header_distance.mm, 1),
+            "footer_distance_mm": round(doc.sections[0].footer_distance.mm, 1),
+        },
+    }
+
+
+def _first_paragraph(doc, predicate):
+    return next((p for p in doc.paragraphs if predicate(p.text.strip().replace(" ", ""))), None)
+
+
+def _add_thesis_roles(doc, roles):
+    """把通用模板样式扩展成论文语义角色，并加入分页/段落连续性约束。"""
+    body = deepcopy(roles["body"])
+    heading_1 = deepcopy(roles.get("heading_1") or body)
+    heading_2 = roles.get("heading_2")
+
+    for role in ("heading_1", "heading_2", "heading_3"):
+        if role in roles:
+            roles[role]["keep_with_next"] = True
+            roles[role]["keep_together"] = True
+    if "heading_1" in roles:
+        roles["heading_1"]["page_break_before"] = True
+
+    chapter = deepcopy(heading_1)
+    chapter.update({
+        "keep_with_next": True, "keep_together": True,
+        "page_break_before": True, "outline_level": 0,
+    })
+    roles["chapter_heading"] = chapter
+
+    abstract_heading_p = _first_paragraph(doc, lambda text: text == "摘要")
+    abstract_heading = (
+        _paragraph_rule(doc, abstract_heading_p, "abstract_heading")
+        if abstract_heading_p is not None else deepcopy(heading_1)
+    )
+    abstract_heading.update({"keep_with_next": True, "keep_together": True})
+    abstract_heading.pop("page_break_before", None)
+    roles["abstract_heading"] = abstract_heading
+
+    abstract_body = deepcopy(body)
+    abstract_body.pop("numbering", None)
+    abstract_body["first_line_indent_chars"] = 0
+    abstract_body["label_prefix"] = {
+        "text": ["摘要：", "摘要:"], "bold": True,
+    }
+    roles["abstract_body"] = abstract_body
+
+    keywords = deepcopy(body)
+    keywords.pop("numbering", None)
+    keywords["first_line_indent_chars"] = 0
+    keywords["label_prefix"] = {
+        "text": ["关键词：", "关键词:", "关键字：", "关键字:"], "bold": True,
+    }
+    roles["keywords"] = keywords
+
+    bibliography_heading_p = _first_paragraph(doc, lambda text: text == "参考文献")
+    bibliography_heading = (
+        _paragraph_rule(doc, bibliography_heading_p, "bibliography_heading")
+        if bibliography_heading_p is not None else deepcopy(heading_1)
+    )
+    bibliography_heading.update({
+        "keep_with_next": True, "keep_together": True,
+        "page_break_before": True, "outline_level": 0,
+    })
+    roles["bibliography_heading"] = bibliography_heading
+
+    bibliography_entry = deepcopy(roles.get("attachment") or body)
+    bibliography_entry.pop("numbering", None)
+    bibliography_entry.pop("first_line_indent_chars", None)
+    bibliography_entry.update({
+        "alignment": "left", "left_indent_chars": 2,
+        "hanging_indent_chars": 2, "widow_control": True,
+    })
+    roles["bibliography_entry"] = bibliography_entry
+
+    equation = deepcopy(body)
+    equation.pop("numbering", None)
+    equation.pop("first_line_indent_chars", None)
+    equation.update({"alignment": "center", "keep_together": True})
+    roles["equation"] = equation
+
+    appendix = deepcopy(chapter)
+    roles["appendix_heading"] = appendix
+
+    if heading_2 is not None:
+        heading_2.setdefault("keep_with_next", True)
+
+
 def _page_section(doc):
     """页面级设置。多节文档取"主流边距"：封面/扉页节的边距常为 0 或极小，
     不能代表正文版心——从所有节里取合法边距（四边均 >=5mm）中出现最多的。"""
@@ -422,40 +651,22 @@ def extract_rules_from_template(template_path, rolemap):
     roles = {}
     representatives = _representative_paragraphs(paras, rolemap)
     for role, p in representatives.items():
-        props = effective_props(p)
-        eastasia = props.get("eastasia") or "宋体"
-        size_pt = props.get("size_pt") or 10.5
-        rule = {"font_eastasia": eastasia, "size_pt": size_pt,
-                "bold": bool(props.get("bold"))}
-        if props.get("ascii"):
-            rule["font_ascii"] = props["ascii"]
-        a = _para_alignment(p)
-        if a:
-            rule["alignment"] = a
-        ls = _para_line_spacing(p)
-        if ls:
-            rule["line_spacing"] = ls
-        flc = _para_indent_chars(p, size_pt)
-        if flc:
-            rule["first_line_indent_chars"] = flc
-        space_before = _para_spacing_pt(p, "w:before")
-        space_after = _para_spacing_pt(p, "w:after")
-        if space_before is not None:
-            rule["space_before_pt"] = space_before
-        if space_after is not None:
-            rule["space_after_pt"] = space_after
-        numbering = _numbering_rule(doc, p, role)
-        if numbering is not None:
-            rule["numbering"] = numbering
-        roles[role] = rule
+        roles[role] = _paragraph_rule(doc, p, role)
 
     if "body" not in roles:
         raise ValueError("模板中没有标注 body 角色的段落，无法确定正文格式")
-    # schema 要求每个角色至少有 alignment；读不到时给合理默认
-    for role, rule in roles.items():
-        rule.setdefault("alignment", "justify" if role == "body" else "left")
+    profile = _detect_profile(doc)
+    if profile == "thesis":
+        _add_thesis_roles(doc, roles)
 
-    spec = {"page": _page_section(doc), "roles": roles}
+    spec = {
+        "profile": profile,
+        "cleanup": {"mode": "strict" if profile == "thesis" else "controlled"},
+        "page": _page_section(doc),
+        "roles": roles,
+    }
+    if profile == "thesis":
+        spec["structure"] = _thesis_structure(doc)
     # 页眉页脚 + 表格规则（模板有就读，没有就不编）
     spec["page"].update(_header_footer_rules(doc))
     table_rule = _table_rule(doc)

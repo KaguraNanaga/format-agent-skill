@@ -8,16 +8,23 @@ from core.schema import SpecValidationError, validate_spec
 PROMPT_TEMPLATE = """你是公文/文章排版规范解析器。把用户给的格式规范文字，转换成下面这个 JSON schema，
 只输出 JSON，不要任何解释。
 schema 角色枚举: title/subtitle/heading_1/heading_2/heading_3/body/signature/date/
-attachment_label/attachment/other。规范里没提到的角色不要输出；没提到的字段不要编。
+attachment_label/attachment/figure_caption/table_caption/other，以及论文专用的
+abstract_heading/abstract_body/keywords/chapter_heading/bibliography_heading/
+bibliography_entry/equation/appendix_heading。规范里没提到的角色不要输出；没提到的字段不要编。
 顶层结构: {{"page": {{"size": "A4", "margin": {{"top_mm":..,"bottom_mm":..,"left_mm":..,"right_mm":..}},
 "line_grid": {{"line_pt":..}}}}, "roles": {{"body": {{...}}, ...}}}}。roles.body 必填。
-字段: font_eastasia(中文字体名)/font_ascii/size_pt(磅)/bold/alignment(left|center|
-right|justify)/first_line_indent_chars(字符数)/line_spacing({{"type":"exact"|"multiple","pt":..}})。
+字段: font_eastasia(中文字体名)/font_ascii/size_pt(磅)/bold/italic/underline/color(六位RGB)/
+alignment(left|center|right|justify)/first_line_indent_chars/left_indent_chars/
+hanging_indent_chars(字符数)/line_spacing({{"type":"exact"|"multiple","pt":..}})/
+keep_with_next/keep_together/page_break_before/widow_control。
+摘要、关键词的行内标签可用 label_prefix：
+{{"text":["摘要：","摘要:"],"bold":true}}，只作用于前缀，不把整段加粗。
 若规范明确要求自动编号，可在相应角色增加 numbering：
 {{"group":"headings","level":0~8,"num_format":"chineseCounting|decimal|...",
 "level_text":"%1、","start":1,"suffix":"tab|space|nothing","alignment":"left|center|right"}}。
 同一套多级标题必须使用相同 group；没有明确编号要求时不要添加 numbering。
-页面字段: page.margin(毫米)/page.line_grid.line_pt。
+论文规范可在顶层输出 "profile":"thesis" 和 "cleanup":{{"mode":"strict"}}；
+一般文档默认 profile=general、cleanup.mode=controlled。页面字段: page.margin(毫米)/page.line_grid.line_pt。
 数值必须合理: size_pt 8~72, margin 5~50, first_line_indent_chars 0~8。
 每个角色至少要有 font_eastasia、size_pt、alignment 三个字段。
 规范文字如下：
