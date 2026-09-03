@@ -4,6 +4,8 @@
 
 Give an Agent a formatting standard and a Word draft. The skill identifies document structure, transfers styles and page rules, checks the result, and produces an editable, auditable DOCX.
 
+> Prefer a graphical upload-and-download interface? Use **[Format Agent Workbench](https://github.com/KaguraNanaga/format-agent-workbench)**. It includes one-click Windows startup and a demo that needs no API key.
+
 The formatting source can be:
 
 - plain-language rules;
@@ -160,4 +162,5 @@ End-to-end validation completed on 2026-09-02 on Windows with Microsoft Word and
 
 ## Related
 
-- Archived hackathon edition with GUI and case gallery: [format-agent](https://github.com/KaguraNanaga/format-agent)
+- Graphical workbench: [format-agent-workbench](https://github.com/KaguraNanaga/format-agent-workbench)
+- Original hackathon version: [format-agent-01](https://github.com/KaguraNanaga/format-agent-01) (historical record only)

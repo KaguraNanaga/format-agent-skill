@@ -4,6 +4,8 @@
 
 把格式规范和待排版 Word 文稿交给 Agent，自动完成结构识别、样式迁移、页面整理和质量检查，输出可继续编辑、可审计的 DOCX。
 
+> 想直接打开界面上传文档？请使用 **[Format Agent Workbench](https://github.com/KaguraNanaga/format-agent-workbench)**。Windows 提供一键启动，内置演示无需 API Key。
+
 格式来源可以是：
 
 - 一段自然语言规范；
@@ -174,4 +176,5 @@ python main.py --style-pack us-legal-brief --target brief.docx --out output/brie
 
 ## 相关项目
 
-- 黑客松完整版（GUI、案例和路演页）：[format-agent](https://github.com/KaguraNanaga/format-agent)（已归档）
+- 图形工作台：[format-agent-workbench](https://github.com/KaguraNanaga/format-agent-workbench)
+- 黑客松初始版本：[format-agent-01](https://github.com/KaguraNanaga/format-agent-01)（仅作历史记录）
