@@ -20,7 +20,11 @@ from core.style_set import (
     ensure_role_styles,
     resolve_target_body_style,
 )
-from core.track_changes import mark_paragraph_revision, snapshot_paragraph
+from core.track_changes import (
+    flatten_style_formatting,
+    mark_paragraph_revision,
+    snapshot_paragraph,
+)
 
 _HF_ALIGN = {"left": 0, "center": 1, "right": 2, "justify": 3}
 _TABLE_ALIGN = {
@@ -707,6 +711,8 @@ def apply_format(docx_path, spec, rolemap, out_path, track=False,
             style = body_style
             fallback_to_target_body = True
         if track:
+            # 修订稿额外把新样式摊平成直接格式（WPS 兼容；干净稿不做）。
+            flatten_style_formatting(p, getattr(style, "_element", None))
             rev_id = mark_paragraph_revision(p, snapshot, rev_id_start=rev_id)
         changelog.append({
             "idx": idx,
